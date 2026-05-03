@@ -1,0 +1,37 @@
+[Unit]
+Description=mumble-agent - Mumble-Server Verwaltung via Docker
+Documentation=https://github.com/nfsmw15/mumble-agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=exec
+User=mumble-agent
+Group=docker
+EnvironmentFile=/etc/mumble-agent/agent.env
+WorkingDirectory=/opt/mumble-agent
+ExecStart=/opt/mumble-agent/venv/bin/uvicorn agent:app \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --no-access-log \
+  --log-level info
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mumble-agent
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
