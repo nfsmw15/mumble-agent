@@ -107,19 +107,39 @@ def _generate_password(length: int = 16) -> str:
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
+_SUPERUSER_PW_RE = re.compile(r"Password for 'SuperUser' set to '([^']+)'")
+
+def _search_superuser_in_text(text: str) -> str | None:
+    m = _SUPERUSER_PW_RE.search(text)
+    return m.group(1) if m else None
+
 def _extract_superuser_from_logs(c, timeout: int = 30) -> str | None:
-    pattern = re.compile(r"Password for 'SuperUser' set to '([^']+)'")
+    """Polls Docker logs for the SuperUser password log line.
+
+    Mumble logs this only on the very first start. After the polling window
+    expires, falls back to reading the log file from inside the container in
+    case Mumble is writing logs to a file instead of stdout/stderr.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            logs = c.logs(tail=200, timestamps=False).decode("utf-8", errors="replace")
+            logs = c.logs(tail=500, timestamps=False).decode("utf-8", errors="replace")
+            pw = _search_superuser_in_text(logs)
+            if pw:
+                return pw
         except Exception:
-            time.sleep(1)
-            continue
-        m = pattern.search(logs)
-        if m:
-            return m.group(1)
+            pass
         time.sleep(1)
+    # Fallback: Mumble may write logs to a file rather than stdout/stderr.
+    for log_path in ("/data/mumble-server.log", "/data/murmur.log"):
+        try:
+            res = c.exec_run(["cat", log_path], demux=False)
+            if res.exit_code == 0 and res.output:
+                pw = _search_superuser_in_text(res.output.decode("utf-8", errors="replace"))
+                if pw:
+                    return pw
+        except Exception:
+            continue
     return None
 
 def _patch_ini(ini_text: str, updates: dict[str, str]) -> str:
@@ -174,8 +194,30 @@ def _write_config_to_container(c, content: str) -> None:
         raise HTTPException(500, detail=f"put_archive failed: {e}")
 
 def _read_superuser_from_container(c) -> str | None:
-    """Versucht das SuperUser-PW aus den Container-Logs zu lesen."""
-    return _extract_superuser_from_logs(c, timeout=3)
+    """Reads the SuperUser password from the full container log history.
+
+    Unlike _extract_superuser_from_logs, this does not poll — it searches all
+    Docker logs at once (no tail limit), because the password was only logged
+    once at the very first start and may be hundreds of lines back in history.
+    Falls back to the log file inside the container.
+    """
+    try:
+        logs = c.logs(timestamps=False).decode("utf-8", errors="replace")
+        pw = _search_superuser_in_text(logs)
+        if pw:
+            return pw
+    except Exception:
+        pass
+    for log_path in ("/data/mumble-server.log", "/data/murmur.log"):
+        try:
+            res = c.exec_run(["cat", log_path], demux=False)
+            if res.exit_code == 0 and res.output:
+                pw = _search_superuser_in_text(res.output.decode("utf-8", errors="replace"))
+                if pw:
+                    return pw
+        except Exception:
+            continue
+    return None
 
 # --- Endpoints ---
 @app.get("/v1/ping")
