@@ -15,10 +15,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
-import socket
-import ssl
 import string
-import struct
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -223,167 +220,76 @@ def _read_superuser_from_container(c) -> str | None:
             continue
     return None
 
-# --- Mumble Channel-Viewer (minimaler Protokoll-Client) ---
-# Mumble verwendet Protobuf-Nachrichten über TLS-TCP.
-# Jede Nachricht: 2 Byte Typ (big-endian) + 4 Byte Länge + Payload.
-# Wir implementieren nur die Felder die wir brauchen (manuelle Varint-Dekodierung).
+# --- Mumble Channel-Viewer (ohne Client-Connect — SQLite + Log-Parsing) ---
+# Channels: direkt aus der SQLite-DB via docker exec (kein Netzwerk-Connect)
+# Online-User: aus Docker-Logs parsen (Authenticated/Connection-closed Events)
 
-_MUMBLE_MSG_VERSION    = 0
-_MUMBLE_MSG_AUTHENTICATE = 2
-_MUMBLE_MSG_PING       = 3
-_MUMBLE_MSG_SERVER_SYNC = 5
-_MUMBLE_MSG_CHANNEL_STATE = 8
-_MUMBLE_MSG_USER_STATE = 10
+# Cache: {container_id -> (timestamp, result)}
+_viewer_cache: dict[str, tuple[float, dict]] = {}
+_VIEWER_CACHE_TTL = 30  # Sekunden
 
-def _varint_decode(data: bytes, pos: int) -> tuple[int, int]:
-    result, shift = 0, 0
-    while pos < len(data):
-        b = data[pos]; pos += 1
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result, pos
-        shift += 7
-    return result, pos
+# Log-Regex für User-Events — kein Mumble-Client-Connect nötig
+_LOG_AUTH_RE = re.compile(r'=> <(\d+):([^(]+)\(\d+\)> Authenticated')
+_LOG_DISC_RE = re.compile(r'=> <(\d+):[^(]+\(\d+\)> (?:Connection closed|Timeout|Disconnecting)')
+_LOG_BOOT_RE = re.compile(r'Booting servers|Generating new tables')
 
-def _parse_string(data: bytes, pos: int) -> tuple[str, int]:
-    length, pos = _varint_decode(data, pos)
-    return data[pos:pos + length].decode("utf-8", errors="replace"), pos + length
-
-def _parse_channel_state(payload: bytes) -> dict | None:
-    """Parst ChannelState-Nachricht: channel_id, parent, name."""
+def _get_channels_from_db(c) -> dict[int, dict]:
+    """Liest Channel-Struktur direkt aus der SQLite-DB — kein Netzwerk-Connect."""
     try:
-        pos = 0
-        channel_id = parent = None
-        name = ""
-        while pos < len(payload):
-            tag, pos = _varint_decode(payload, pos)
-            field, wire = tag >> 3, tag & 0x7
-            if wire == 0:      # varint
-                val, pos = _varint_decode(payload, pos)
-                if field == 1: channel_id = val
-                if field == 2: parent = val
-            elif wire == 2:    # length-delimited
-                length, pos = _varint_decode(payload, pos)
-                raw = payload[pos:pos + length]
-                if field == 3: name = raw.decode("utf-8", errors="replace")
-                pos += length
-            else:
-                break
-        if channel_id is None:
-            return None
-        return {"id": channel_id, "parent": parent, "name": name}
+        res = c.exec_run(
+            ["sqlite3", "-readonly", "/data/mumble-server.sqlite",
+             "SELECT channel_id, parent_id, name FROM channels WHERE server_id=1;"],
+            demux=False
+        )
+        if res.exit_code != 0 or not res.output:
+            return {}
+        channels: dict[int, dict] = {}
+        for line in res.output.decode("utf-8", errors="replace").strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            cid = int(parts[0])
+            parent = int(parts[1]) if parts[1].strip() else None
+            name = parts[2]
+            channels[cid] = {"id": cid, "parent": parent, "name": name}
+        return channels
     except Exception:
-        return None
+        return {}
 
-def _parse_user_state(payload: bytes) -> dict | None:
-    """Parst UserState-Nachricht: session, channel_id, name."""
+def _get_online_users_from_logs(c) -> list[str]:
+    """Parst Docker-Logs auf Authenticated/Disconnect-Events — kein Netzwerk-Connect."""
     try:
-        pos = 0
-        session = channel_id = None
-        name = ""
-        while pos < len(payload):
-            tag, pos = _varint_decode(payload, pos)
-            field, wire = tag >> 3, tag & 0x7
-            if wire == 0:
-                val, pos = _varint_decode(payload, pos)
-                if field == 1: session = val
-                if field == 6: channel_id = val
-            elif wire == 2:
-                length, pos = _varint_decode(payload, pos)
-                raw = payload[pos:pos + length]
-                if field == 2: name = raw.decode("utf-8", errors="replace")
-                pos += length
-            else:
-                break
-        if session is None:
-            return None
-        return {"session": session, "channel_id": channel_id or 0, "name": name}
+        logs = c.logs(timestamps=False).decode("utf-8", errors="replace")
     except Exception:
-        return None
+        return []
+    lines = logs.splitlines()
+    # Ab dem letzten Server-Start lesen (davor sind alle User weg)
+    last_boot = 0
+    for i, line in enumerate(lines):
+        if _LOG_BOOT_RE.search(line):
+            last_boot = i
+    online: dict[int, str] = {}
+    for line in lines[last_boot:]:
+        m = _LOG_AUTH_RE.search(line)
+        if m:
+            online[int(m.group(1))] = m.group(2).strip()
+            continue
+        m = _LOG_DISC_RE.search(line)
+        if m:
+            online.pop(int(m.group(1)), None)
+    return list(online.values())
 
-def _mumble_send(sock: ssl.SSLSocket, msg_type: int, payload: bytes) -> None:
-    header = struct.pack(">HI", msg_type, len(payload))
-    sock.sendall(header + payload)
+def get_mumble_viewer(c) -> dict:
+    """Channel-Baum + Online-User — vollständig ohne Mumble-Client-Connect."""
+    now = time.time()
+    if c.id in _viewer_cache:
+        ts, cached = _viewer_cache[c.id]
+        if now - ts < _VIEWER_CACHE_TTL:
+            return cached
 
-def _mumble_recv(sock: ssl.SSLSocket) -> tuple[int, bytes]:
-    header = b""
-    while len(header) < 6:
-        chunk = sock.recv(6 - len(header))
-        if not chunk:
-            raise ConnectionError("connection closed")
-        header += chunk
-    msg_type, length = struct.unpack(">HI", header)
-    payload = b""
-    while len(payload) < length:
-        chunk = sock.recv(min(4096, length - len(payload)))
-        if not chunk:
-            raise ConnectionError("connection closed")
-        payload += chunk
-    return msg_type, payload
+    channels = _get_channels_from_db(c)
+    online_users = _get_online_users_from_logs(c)
 
-def _build_version_msg() -> bytes:
-    # Version: field 1 (version uint32) = 0x00010300 (1.3.0), field 3 (string release)
-    def varint(n: int) -> bytes:
-        out = []
-        while True:
-            b = n & 0x7F; n >>= 7
-            out.append(b | (0x80 if n else 0))
-            if not n: break
-        return bytes(out)
-    def field_varint(f: int, v: int) -> bytes:
-        return varint((f << 3) | 0) + varint(v)
-    def field_string(f: int, s: str) -> bytes:
-        enc = s.encode()
-        return varint((f << 3) | 2) + varint(len(enc)) + enc
-    return field_varint(1, 0x00010300) + field_string(3, "mumble-agent-viewer")
-
-def _build_auth_msg(username: str = "ChannelViewer") -> bytes:
-    def varint(n: int) -> bytes:
-        out = []
-        while True:
-            b = n & 0x7F; n >>= 7
-            out.append(b | (0x80 if n else 0))
-            if not n: break
-        return bytes(out)
-    def field_string(f: int, s: str) -> bytes:
-        enc = s.encode()
-        return varint((f << 3) | 2) + varint(len(enc)) + enc
-    return field_string(1, username)  # field 1 = username
-
-def get_mumble_viewer(host: str, port: int, timeout: int = 8) -> dict:
-    """Verbindet zum Mumble-Server, liest Channel/User-State, trennt sofort."""
-    channels: dict[int, dict] = {}
-    users: list[dict] = []
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        raw = socket.create_connection((host, port), timeout=timeout)
-        sock = ctx.wrap_socket(raw)
-        sock.settimeout(timeout)
-        _mumble_send(sock, _MUMBLE_MSG_VERSION, _build_version_msg())
-        _mumble_send(sock, _MUMBLE_MSG_AUTHENTICATE, _build_auth_msg())
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                msg_type, payload = _mumble_recv(sock)
-            except (TimeoutError, socket.timeout):
-                break
-            if msg_type == _MUMBLE_MSG_CHANNEL_STATE:
-                ch = _parse_channel_state(payload)
-                if ch:
-                    channels[ch["id"]] = ch
-            elif msg_type == _MUMBLE_MSG_USER_STATE:
-                u = _parse_user_state(payload)
-                if u and u["name"]:
-                    users.append(u)
-            elif msg_type == _MUMBLE_MSG_SERVER_SYNC:
-                break  # alle initialen Daten empfangen
-        sock.close()
-    except Exception as e:
-        return {"ok": False, "error": str(e), "channels": [], "users": []}
-
-    # Channel-Baum aufbauen
     def build_tree(parent_id: int | None) -> list:
         children = []
         for ch in sorted(channels.values(), key=lambda x: x["name"].lower()):
@@ -391,15 +297,16 @@ def get_mumble_viewer(host: str, port: int, timeout: int = 8) -> dict:
                 children.append({
                     "id": ch["id"],
                     "name": ch["name"],
-                    "users": [u["name"] for u in users if u["channel_id"] == ch["id"]],
+                    "users": [],
                     "children": build_tree(ch["id"]),
                 })
         return children
 
-    root_users = [u["name"] for u in users if u["channel_id"] == 0]
-    root = {"id": 0, "name": channels.get(0, {}).get("name", "Root"),
-            "users": root_users, "children": build_tree(0)}
-    return {"ok": True, "channels": root, "user_count": len(users)}
+    root_name = channels.get(0, {}).get("name") or "Root"
+    root = {"id": 0, "name": root_name, "users": online_users, "children": build_tree(0)}
+    result = {"ok": True, "channels": root, "user_count": len(online_users)}
+    _viewer_cache[c.id] = (now, result)
+    return result
 
 # --- Endpoints ---
 @app.get("/v1/ping")
@@ -763,7 +670,7 @@ async def put_config(cid: str, req: ConfigUpdateRequest, authorization: str = He
 
 @app.get("/v1/servers/{cid}/viewer")
 async def channel_viewer(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Gibt Channel-Baum + Online-User des Mumble-Servers zurück."""
+    """Gibt Channel-Baum + Online-User zurück — ohne Mumble-Client-Connect."""
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -771,11 +678,7 @@ async def channel_viewer(cid: str, authorization: str = Header(default=None)) ->
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
-    port_label = c.labels.get("mumble-agent.port", "")
-    if not port_label.isdigit():
-        raise HTTPException(500, detail="cannot determine server port")
-    host = "127.0.0.1" if DOCKER_NETWORK == "host" else c.attrs.get("NetworkSettings", {}).get("IPAddress", "127.0.0.1")
-    result = get_mumble_viewer(host, int(port_label))
+    result = get_mumble_viewer(c)
     if not result["ok"]:
         raise HTTPException(503, detail=result.get("error", "viewer unavailable"))
     return result
