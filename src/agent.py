@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Andreas P. <https://nfsmw15.de>
 """
-mumble-agent v1.2.0
+mumble-agent v1.3.0
 
 FastAPI-Service zum Verwalten von Mumble-Servern als Docker-Container.
 
 Aenderung v1.2.2: Config/SuperUser-Zugriff ueber docker exec statt
 direktem Dateisystem-Zugriff (loest Mount-Namespace-Probleme).
+Aenderung v1.3.0: Channel-Viewer via minimalem Mumble-Protokoll-Client.
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import socket
+import ssl
 import string
+import struct
 import subprocess
 import time
 from contextlib import asynccontextmanager
@@ -27,7 +31,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "1.2.2"
+AGENT_VERSION = "1.3.0"
 
 AGENT_TOKEN = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:latest")
@@ -218,6 +222,184 @@ def _read_superuser_from_container(c) -> str | None:
         except Exception:
             continue
     return None
+
+# --- Mumble Channel-Viewer (minimaler Protokoll-Client) ---
+# Mumble verwendet Protobuf-Nachrichten über TLS-TCP.
+# Jede Nachricht: 2 Byte Typ (big-endian) + 4 Byte Länge + Payload.
+# Wir implementieren nur die Felder die wir brauchen (manuelle Varint-Dekodierung).
+
+_MUMBLE_MSG_VERSION    = 0
+_MUMBLE_MSG_AUTHENTICATE = 2
+_MUMBLE_MSG_PING       = 3
+_MUMBLE_MSG_SERVER_SYNC = 5
+_MUMBLE_MSG_CHANNEL_STATE = 8
+_MUMBLE_MSG_USER_STATE = 10
+
+def _varint_decode(data: bytes, pos: int) -> tuple[int, int]:
+    result, shift = 0, 0
+    while pos < len(data):
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+    return result, pos
+
+def _parse_string(data: bytes, pos: int) -> tuple[str, int]:
+    length, pos = _varint_decode(data, pos)
+    return data[pos:pos + length].decode("utf-8", errors="replace"), pos + length
+
+def _parse_channel_state(payload: bytes) -> dict | None:
+    """Parst ChannelState-Nachricht: channel_id, parent, name."""
+    try:
+        pos = 0
+        channel_id = parent = None
+        name = ""
+        while pos < len(payload):
+            tag, pos = _varint_decode(payload, pos)
+            field, wire = tag >> 3, tag & 0x7
+            if wire == 0:      # varint
+                val, pos = _varint_decode(payload, pos)
+                if field == 1: channel_id = val
+                if field == 2: parent = val
+            elif wire == 2:    # length-delimited
+                length, pos = _varint_decode(payload, pos)
+                raw = payload[pos:pos + length]
+                if field == 3: name = raw.decode("utf-8", errors="replace")
+                pos += length
+            else:
+                break
+        if channel_id is None:
+            return None
+        return {"id": channel_id, "parent": parent, "name": name}
+    except Exception:
+        return None
+
+def _parse_user_state(payload: bytes) -> dict | None:
+    """Parst UserState-Nachricht: session, channel_id, name."""
+    try:
+        pos = 0
+        session = channel_id = None
+        name = ""
+        while pos < len(payload):
+            tag, pos = _varint_decode(payload, pos)
+            field, wire = tag >> 3, tag & 0x7
+            if wire == 0:
+                val, pos = _varint_decode(payload, pos)
+                if field == 1: session = val
+                if field == 6: channel_id = val
+            elif wire == 2:
+                length, pos = _varint_decode(payload, pos)
+                raw = payload[pos:pos + length]
+                if field == 2: name = raw.decode("utf-8", errors="replace")
+                pos += length
+            else:
+                break
+        if session is None:
+            return None
+        return {"session": session, "channel_id": channel_id or 0, "name": name}
+    except Exception:
+        return None
+
+def _mumble_send(sock: ssl.SSLSocket, msg_type: int, payload: bytes) -> None:
+    header = struct.pack(">HI", msg_type, len(payload))
+    sock.sendall(header + payload)
+
+def _mumble_recv(sock: ssl.SSLSocket) -> tuple[int, bytes]:
+    header = b""
+    while len(header) < 6:
+        chunk = sock.recv(6 - len(header))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        header += chunk
+    msg_type, length = struct.unpack(">HI", header)
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(min(4096, length - len(payload)))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        payload += chunk
+    return msg_type, payload
+
+def _build_version_msg() -> bytes:
+    # Version: field 1 (version uint32) = 0x00010300 (1.3.0), field 3 (string release)
+    def varint(n: int) -> bytes:
+        out = []
+        while True:
+            b = n & 0x7F; n >>= 7
+            out.append(b | (0x80 if n else 0))
+            if not n: break
+        return bytes(out)
+    def field_varint(f: int, v: int) -> bytes:
+        return varint((f << 3) | 0) + varint(v)
+    def field_string(f: int, s: str) -> bytes:
+        enc = s.encode()
+        return varint((f << 3) | 2) + varint(len(enc)) + enc
+    return field_varint(1, 0x00010300) + field_string(3, "mumble-agent-viewer")
+
+def _build_auth_msg(username: str = "ChannelViewer") -> bytes:
+    def varint(n: int) -> bytes:
+        out = []
+        while True:
+            b = n & 0x7F; n >>= 7
+            out.append(b | (0x80 if n else 0))
+            if not n: break
+        return bytes(out)
+    def field_string(f: int, s: str) -> bytes:
+        enc = s.encode()
+        return varint((f << 3) | 2) + varint(len(enc)) + enc
+    return field_string(1, username)  # field 1 = username
+
+def get_mumble_viewer(host: str, port: int, timeout: int = 8) -> dict:
+    """Verbindet zum Mumble-Server, liest Channel/User-State, trennt sofort."""
+    channels: dict[int, dict] = {}
+    users: list[dict] = []
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        raw = socket.create_connection((host, port), timeout=timeout)
+        sock = ctx.wrap_socket(raw)
+        sock.settimeout(timeout)
+        _mumble_send(sock, _MUMBLE_MSG_VERSION, _build_version_msg())
+        _mumble_send(sock, _MUMBLE_MSG_AUTHENTICATE, _build_auth_msg())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg_type, payload = _mumble_recv(sock)
+            except (TimeoutError, socket.timeout):
+                break
+            if msg_type == _MUMBLE_MSG_CHANNEL_STATE:
+                ch = _parse_channel_state(payload)
+                if ch:
+                    channels[ch["id"]] = ch
+            elif msg_type == _MUMBLE_MSG_USER_STATE:
+                u = _parse_user_state(payload)
+                if u and u["name"]:
+                    users.append(u)
+            elif msg_type == _MUMBLE_MSG_SERVER_SYNC:
+                break  # alle initialen Daten empfangen
+        sock.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e), "channels": [], "users": []}
+
+    # Channel-Baum aufbauen
+    def build_tree(parent_id: int | None) -> list:
+        children = []
+        for ch in sorted(channels.values(), key=lambda x: x["name"].lower()):
+            if ch["parent"] == parent_id and ch["id"] != 0:
+                children.append({
+                    "id": ch["id"],
+                    "name": ch["name"],
+                    "users": [u["name"] for u in users if u["channel_id"] == ch["id"]],
+                    "children": build_tree(ch["id"]),
+                })
+        return children
+
+    root_users = [u["name"] for u in users if u["channel_id"] == 0]
+    root = {"id": 0, "name": channels.get(0, {}).get("name", "Root"),
+            "users": root_users, "children": build_tree(0)}
+    return {"ok": True, "channels": root, "user_count": len(users)}
 
 # --- Endpoints ---
 @app.get("/v1/ping")
@@ -578,6 +760,25 @@ async def put_config(cid: str, req: ConfigUpdateRequest, authorization: str = He
         raise HTTPException(500, detail=f"cannot recreate container: {e}")
 
     return {"ok": True, "size": len(req.content), "container_id": new_c.id}
+
+@app.get("/v1/servers/{cid}/viewer")
+async def channel_viewer(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Gibt Channel-Baum + Online-User des Mumble-Servers zurück."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    port_label = c.labels.get("mumble-agent.port", "")
+    if not port_label.isdigit():
+        raise HTTPException(500, detail="cannot determine server port")
+    host = "127.0.0.1" if DOCKER_NETWORK == "host" else c.attrs.get("NetworkSettings", {}).get("IPAddress", "127.0.0.1")
+    result = get_mumble_viewer(host, int(port_label))
+    if not result["ok"]:
+        raise HTTPException(503, detail=result.get("error", "viewer unavailable"))
+    return result
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
