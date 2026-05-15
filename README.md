@@ -1,12 +1,12 @@
 # mumble-agent
 
-Lightweight FastAPI service zum Verwalten von Mumble-Servern als Docker-Container auf einem Linux-Host.
+Leichtgewichtiger FastAPI-Service zum Verwalten von Mumble-Servern als Docker-Container auf einem Linux-Host.
 
-Gehört zu [Easy2-Mumble](https://github.com/nfsmw15/Easy2-Mumble) — der Webserver-Erweiterung für [Easy2-PHP8](https://github.com/nfsmw15/Easy2-PHP8) (`main-dashboard`).
+Gehört zu [Easy2-Mumble](https://github.com/nfsmw15/easy2-mumble) — der Webserver-Erweiterung für [Easy2-PHP8](https://github.com/nfsmw15/Easy2-PHP8) (`main-dashboard`).
 
 ## Was macht der Agent?
 
-Auf jedem Mumble-Host (VPS, Root-Server, Proxmox-VM oder physisch) läuft eine Instanz des `mumble-agent`. Der Agent nimmt HTTPS-Requests vom Easy2-Webserver entgegen (Bearer-Token authentifiziert) und steuert lokal die Docker-Container, in denen die einzelnen Mumble-Server laufen.
+Auf jedem Mumble-Host läuft eine Instanz des `mumble-agent`. Er nimmt HTTPS-Requests vom Easy2-Webserver entgegen (Bearer-Token authentifiziert) und steuert lokal die Docker-Container der einzelnen Mumble-Server.
 
 ```
 ┌───────────────────┐  HTTPS+Token  ┌─────────────────────────┐
@@ -18,38 +18,52 @@ Auf jedem Mumble-Host (VPS, Root-Server, Proxmox-VM oder physisch) läuft eine I
 
 ## API
 
-Alle Endpoints unter `/v1`, alle benötigen `Authorization: Bearer <token>`:
+Alle Endpoints unter `/v1/`, alle benötigen `Authorization: Bearer <token>`:
 
 | Method | Path | Zweck |
 |--------|------|-------|
-| GET    | `/ping` | Liveness-Check |
-| POST   | `/servers` | Neuen Mumble-Container erstellen |
-| DELETE | `/servers/{cid}` | Container löschen |
-| POST   | `/servers/{cid}/start` | Container starten |
-| POST   | `/servers/{cid}/stop` | Container stoppen |
-| POST   | `/servers/{cid}/restart` | Container neu starten |
-| GET    | `/servers/{cid}/stats` | Online-User + Uptime |
-| GET    | `/servers/{cid}/logs?tail=N` | Letzte N Log-Zeilen |
-| PATCH  | `/servers/{cid}` | Konfiguration ändern (Restart) |
+| GET    | `/v1/ping` | Liveness-Check |
+| POST   | `/v1/servers` | Neuen Mumble-Container erstellen |
+| DELETE | `/v1/servers/{cid}` | Container löschen |
+| POST   | `/v1/servers/{cid}/start` | Container starten |
+| POST   | `/v1/servers/{cid}/stop` | Container stoppen |
+| POST   | `/v1/servers/{cid}/restart` | Container neu starten |
+| GET    | `/v1/servers/{cid}/stats` | Online-User + Uptime |
+| GET    | `/v1/servers/{cid}/logs?tail=N` | Letzte N Log-Zeilen |
+| PATCH  | `/v1/servers/{cid}` | Konfiguration ändern (löst Restart aus) |
+| GET    | `/v1/servers/{cid}/config` | Rohe INI-Konfiguration lesen |
+| PUT    | `/v1/servers/{cid}/config` | Rohe INI-Konfiguration schreiben |
+| GET    | `/v1/servers/{cid}/superuser` | SuperUser-Passwort aus Logs lesen |
+| POST   | `/v1/servers/{cid}/superuser/reset` | SuperUser-Passwort zurücksetzen |
+| GET    | `/v1/servers/{cid}/viewer` | Channel-Struktur + Online-User |
 
 Alle Antworten haben das Format `{"ok": bool, ...}`.
 
+## Channel-Viewer
+
+Der `/viewer`-Endpoint liest Channel-Daten und Online-User **ohne** sich als Mumble-Client einzuloggen — verbundene Nutzer sehen keine Ankündigungen:
+
+- **Channel-Struktur** → direkt aus der SQLite-Datenbank des Containers (`docker exec sqlite3`)
+- **Online-User** → aus den Docker-Logs des Containers (parst `Authenticated`/`Connection closed`-Events)
+
+Ergebnis wird 30 Sekunden gecacht.
+
 ## Sicherheit
 
-* Bearer-Token, im Setup zufällig generiert (32 Byte, hex)
-* Constant-time Vergleich (`secrets.compare_digest`)
-* Container-Label-Guard: nur Container mit `mumble-agent.managed=1` können vom Agent angefasst werden — fremde Docker-Container auf dem Host sind sicher
-* Service läuft als unprivilegierter User `mumble-agent` (in der Gruppe `docker` für API-Zugriff)
-* systemd-Hardening (`ProtectSystem=strict`, `NoNewPrivileges`, etc.)
-* Lauscht nur auf 127.0.0.1:8000 — TLS-Termination muss extern erfolgen
+- Bearer-Token, im Setup zufällig generiert (32 Byte, hex)
+- Constant-time Vergleich (`secrets.compare_digest`)
+- Container-Label-Guard: nur Container mit `mumble-agent.managed=1` werden angefasst
+- Service läuft als unprivilegierter User `mumble-agent` (in der Gruppe `docker`)
+- systemd-Hardening (`ProtectSystem=strict`, `NoNewPrivileges` etc.)
+- Lauscht nur auf `127.0.0.1:8000` — TLS-Termination erfolgt extern
 
 ## Voraussetzungen
 
-* Linux (Debian/Ubuntu getestet, andere Distros analog)
-* Python 3.10+ (für `X | Y` Type-Syntax)
-* Docker
-* systemd
-* TLS-Reverse-Proxy (nginx/Caddy/Traefik)
+- Linux (Debian/Ubuntu getestet)
+- Python 3.10+
+- Docker
+- systemd
+- TLS-Reverse-Proxy (nginx, Caddy, Traefik)
 
 ## Verzeichnisstruktur
 
@@ -62,7 +76,7 @@ mumble-agent/
 │   └── mumble-agent.service  systemd-Unit (gehärtet)
 ├── setup.sh                  Installations-Script
 ├── README.md
-└── LICENSE                   AGPLv3
+└── LICENSE.md                AGPLv3
 ```
 
 ## Installation
@@ -75,14 +89,12 @@ sudo bash setup.sh
 
 Das Script:
 
-1. installiert Pakete (`python3-venv`, `docker.io`, `iproute2`, `openssl`)
-2. legt Service-User `mumble-agent` an (in der Gruppe `docker`)
-3. richtet venv unter `/opt/mumble-agent/venv` ein und installiert FastAPI, uvicorn, docker-py
+1. installiert Pakete (`python3-venv`, `docker.io`, `iproute2`, `sqlite3`)
+2. legt Service-User `mumble-agent` an (Gruppe `docker`)
+3. richtet venv unter `/opt/mumble-agent/venv` ein
 4. generiert einen zufälligen 64-Zeichen-Token in `/etc/mumble-agent/agent.env`
 5. installiert die systemd-Unit (auto-enabled)
-6. zeigt dir den Token am Ende — sicher notieren!
-
-Danach:
+6. zeigt den Token am Ende — sicher notieren!
 
 ```bash
 sudo systemctl start mumble-agent
@@ -91,7 +103,7 @@ sudo systemctl status mumble-agent
 
 ## Reverse-Proxy
 
-Der Agent lauscht intern auf `127.0.0.1:8000`. Davor muss ein TLS-fähiger Reverse-Proxy stehen.
+Der Agent lauscht auf `127.0.0.1:8000`. Davor muss ein TLS-Reverse-Proxy stehen.
 
 ### Caddy
 
@@ -119,25 +131,11 @@ server {
 }
 ```
 
-### Traefik (mit dns-mgr)
-
-```bash
-dns-mgr add-service mumble-agent-host1 \
-  --backend 127.0.0.1:8000 \
-  --domain mumble1.example.com \
-  --internal
-```
-
 ## Test
 
 ```bash
 TOKEN=$(grep MUMBLE_AGENT_TOKEN /etc/mumble-agent/agent.env | cut -d= -f2)
 curl -k https://mumble1.example.com:8443/v1/ping -H "Authorization: Bearer $TOKEN"
-```
-
-Erwartete Antwort:
-```json
-{"ok":true,"agent":"mumble-agent","version":"1.0.0",...}
 ```
 
 ## Konfiguration
@@ -160,34 +158,29 @@ Nach Änderung: `systemctl restart mumble-agent`.
 | 8443 | TCP | Inbound (vom Webserver) | Agent-API |
 | 64738–64838 | TCP+UDP | Inbound (Internet) | Mumble-Clients |
 
-Port-Range nach Bedarf in der Easy2-Mumble Host-Konfiguration anpassen.
-
 ## Logs
 
 ```bash
-journalctl -u mumble-agent -f       # Live
+journalctl -u mumble-agent -f
 journalctl -u mumble-agent --since "1 hour ago"
 ```
 
 ## Deinstallation
 
 ```bash
-sudo systemctl stop mumble-agent
-sudo systemctl disable mumble-agent
-sudo rm /etc/systemd/system/mumble-agent.service
-sudo systemctl daemon-reload
-
+sudo systemctl stop mumble-agent && sudo systemctl disable mumble-agent
+sudo rm /etc/systemd/system/mumble-agent.service && sudo systemctl daemon-reload
 sudo userdel mumble-agent
 sudo rm -rf /opt/mumble-agent /var/lib/mumble-agent /etc/mumble-agent
 
-# Vorhandene Mumble-Container manuell prüfen und entfernen:
+# Vorhandene Mumble-Container prüfen:
 docker ps -a --filter "label=mumble-agent.managed=1"
 docker ps -a --filter "label=mumble-agent.managed=1" -q | xargs -r docker rm -f
 ```
 
 ## Lizenz
 
-AGPLv3 — siehe [LICENSE](LICENSE).
+AGPLv3 — siehe [LICENSE.md](LICENSE.md)
 
 ## Autor
 
