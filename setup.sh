@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "[1/7] System-Pakete installieren..."
 apt-get update -qq
-apt-get install -y -qq python3-venv python3-pip docker.io ca-certificates iproute2 openssl
+apt-get install -y -qq python3-venv python3-pip docker.io ca-certificates iproute2 openssl sqlite3
 
 echo "[2/7] Service-User anlegen..."
 if ! id "$USER" >/dev/null 2>&1; then
@@ -34,6 +34,12 @@ echo "[4/7] Code kopieren..."
 cp "$SCRIPT_DIR/src/agent.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/src/requirements.txt" "$INSTALL_DIR/"
 chown -R "$USER:$USER" "$INSTALL_DIR"
+
+echo "[4b] Zertifikat-Verzeichnis anlegen..."
+install -d -m 0750 -o root -g "$USER" "$CONFIG_DIR/ssl"
+
+echo "[4c] mumble-cert-deploy installieren..."
+install -m 0755 "$SCRIPT_DIR/src/mumble-cert-deploy" /usr/local/bin/mumble-cert-deploy
 
 echo "[5/7] Python venv aufsetzen..."
 sudo -u "$USER" python3 -m venv "$INSTALL_DIR/venv"
@@ -61,11 +67,12 @@ else
     echo "  Token aus der Datei lesen mit: cat $CONFIG_DIR/agent.env"
 fi
 
-echo "[7/7] systemd-Unit installieren..."
+echo "[7/8] systemd-Unit installieren..."
 cp "$SCRIPT_DIR/systemd/mumble-agent.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable mumble-agent.service
 
+echo "[8/8] Fertig."
 echo
 echo "=========================================================="
 echo "Agent installiert. Nächste Schritte:"
@@ -81,4 +88,9 @@ echo
 echo "  5. In der Easy2-Mumble Weboberfläche den Host eintragen mit:"
 echo "       Agent-URL:   https://<dein-fqdn>:8443"
 echo "       Agent-Token: (aus /etc/mumble-agent/agent.env)"
+echo
+echo "  Zertifikat-Deployment:"
+echo "     Zertifikat nach $CONFIG_DIR/ssl/cert.pem + key.pem kopieren,"
+echo "     dann: mumble-cert-deploy"
+echo "     (dns-mgr/certbot/acme.sh können als reload_cmd genutzt werden)"
 echo "=========================================================="

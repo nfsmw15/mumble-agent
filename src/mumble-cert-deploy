@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# mumble-cert-deploy — Zertifikat aus /etc/mumble-agent/ssl/ auf alle
+# laufenden Mumble-Container dieses Hosts anwenden.
+#
+# Aufruf:
+#   mumble-cert-deploy [cert.pem] [key.pem]
+#
+# Ohne Argumente: verwendet /etc/mumble-agent/ssl/cert.pem + key.pem
+#
+# Integration dns-mgr (in dns-mgr.conf):
+#   CERT_TARGETS["mumble01"]="mumble01:/etc/mumble-agent/ssl/cert.pem:/etc/mumble-agent/ssl/key.pem:mumble-cert-deploy:mumble01.example.com"
+#
+# Integration certbot (in /etc/letsencrypt/renewal-hooks/deploy/):
+#   #!/bin/bash
+#   install -m 0644 "$RENEWED_LINEAGE/fullchain.pem" /etc/mumble-agent/ssl/cert.pem
+#   install -m 0600 "$RENEWED_LINEAGE/privkey.pem"   /etc/mumble-agent/ssl/key.pem
+#   mumble-cert-deploy
+#
+# Integration acme.sh:
+#   acme.sh --install-cert -d mumble01.example.com \
+#     --cert-file      /etc/mumble-agent/ssl/cert.pem \
+#     --key-file       /etc/mumble-agent/ssl/key.pem \
+#     --reloadcmd      "mumble-cert-deploy"
+
+set -euo pipefail
+
+CERT="${1:-/etc/mumble-agent/ssl/cert.pem}"
+KEY="${2:-/etc/mumble-agent/ssl/key.pem}"
+AGENT_ENV="/etc/mumble-agent/agent.env"
+AGENT_URL="http://localhost:8000"
+
+# ── Prüfungen ────────────────────────────────────────────────────────────────
+[[ -f "$CERT" ]] || { echo "FEHLER: Zertifikat nicht gefunden: $CERT" >&2; exit 1; }
+[[ -f "$KEY"  ]] || { echo "FEHLER: Schlüssel nicht gefunden: $KEY" >&2; exit 1; }
+[[ -f "$AGENT_ENV" ]] || { echo "FEHLER: $AGENT_ENV nicht gefunden" >&2; exit 1; }
+
+TOKEN=$(grep -E '^MUMBLE_AGENT_TOKEN=' "$AGENT_ENV" | cut -d= -f2-)
+[[ -n "$TOKEN" ]] || { echo "FEHLER: MUMBLE_AGENT_TOKEN nicht gefunden in $AGENT_ENV" >&2; exit 1; }
+
+# JSON-sicheres Einlesen der PEM-Dateien
+CERT_JSON=$(python3 -c 'import sys,json; print(json.dumps(open(sys.argv[1]).read()))' "$CERT")
+KEY_JSON=$(python3  -c 'import sys,json; print(json.dumps(open(sys.argv[1]).read()))' "$KEY")
+
+# ── Alle verwalteten Container aktualisieren ─────────────────────────────────
+updated=0; failed=0
+while IFS= read -r cid; do
+    [[ -z "$cid" ]] && continue
+    name=$(docker inspect --format '{{.Name}}' "$cid" 2>/dev/null | tr -d '/')
+    echo -n "  $name ($cid) ... "
+    resp=$(curl -sf -w "\n%{http_code}" -X PUT "${AGENT_URL}/v1/servers/${cid}/certificate" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"cert\":${CERT_JSON},\"key\":${KEY_JSON}}" 2>/dev/null || echo -e "\n000")
+    http_code=$(echo "$resp" | tail -1)
+    if [[ "$http_code" == "200" ]]; then
+        echo "OK"
+        ((updated++))
+    else
+        echo "FEHLER (HTTP $http_code)"
+        ((failed++))
+    fi
+done < <(docker ps --filter "label=mumble-agent.managed=1" -q 2>/dev/null)
+
+echo ""
+echo "Fertig: $updated aktualisiert, $failed fehlgeschlagen."
+[[ $failed -eq 0 ]]
