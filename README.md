@@ -20,6 +20,8 @@ Auf jedem Mumble-Host läuft eine Instanz des `mumble-agent`. Er nimmt HTTPS-Req
 
 Alle Endpoints unter `/v1/`, alle benötigen `Authorization: Bearer <token>`:
 
+### Container-Verwaltung
+
 | Method | Path | Zweck |
 |--------|------|-------|
 | GET    | `/v1/ping` | Liveness-Check |
@@ -28,25 +30,46 @@ Alle Endpoints unter `/v1/`, alle benötigen `Authorization: Bearer <token>`:
 | POST   | `/v1/servers/{cid}/start` | Container starten |
 | POST   | `/v1/servers/{cid}/stop` | Container stoppen |
 | POST   | `/v1/servers/{cid}/restart` | Container neu starten |
-| GET    | `/v1/servers/{cid}/stats` | Online-User + Uptime |
+| GET    | `/v1/servers/{cid}/stats` | Online-User + Uptime (via ICE) |
 | GET    | `/v1/servers/{cid}/logs?tail=N` | Letzte N Log-Zeilen |
-| PATCH  | `/v1/servers/{cid}` | Konfiguration ändern (löst Restart aus) |
+| PATCH  | `/v1/servers/{cid}` | Konfiguration ändern (löst Container-Recreate aus) |
+| GET    | `/v1/servers/{cid}/settings` | Aktuelle Einstellungen aus ENV lesen |
 | GET    | `/v1/servers/{cid}/config` | Rohe INI-Konfiguration lesen |
 | PUT    | `/v1/servers/{cid}/config` | Rohe INI-Konfiguration schreiben |
 | GET    | `/v1/servers/{cid}/superuser` | SuperUser-Passwort aus Logs lesen |
 | POST   | `/v1/servers/{cid}/superuser/reset` | SuperUser-Passwort zurücksetzen |
-| GET    | `/v1/servers/{cid}/viewer` | Channel-Struktur + Online-User |
+| PUT    | `/v1/servers/{cid}/certificate` | TLS-Zertifikat hochladen |
+| DELETE | `/v1/servers/{cid}/certificate` | TLS-Zertifikat entfernen |
+
+### ZeroC ICE — Live-Verwaltung (kein Neustart)
+
+| Method | Path | Zweck |
+|--------|------|-------|
+| GET    | `/v1/servers/{cid}/viewer` | Channel-Baum + Online-User (ICE `getTree()`) |
+| GET    | `/v1/servers/{cid}/users` | Verbundene User (ICE `getUsers()`) |
+| POST   | `/v1/servers/{cid}/users/{session}/kick` | User kicken (ICE `kickUser()`) |
+| PATCH  | `/v1/servers/{cid}/users/{session}` | Mute/Deaf setzen (ICE `setState()`) |
+| GET    | `/v1/servers/{cid}/channels` | Channel-Map (ICE `getChannels()`) |
+| POST   | `/v1/servers/{cid}/channels` | Channel erstellen (ICE `addChannel()`) |
+| PATCH  | `/v1/servers/{cid}/channels/{id}` | Channel bearbeiten (ICE `setChannelState()`) |
+| DELETE | `/v1/servers/{cid}/channels/{id}` | Channel löschen (ICE `removeChannel()`) |
+| GET    | `/v1/servers/{cid}/acl` | ACL lesen (ICE `getACL()`) |
+| PUT    | `/v1/servers/{cid}/acl` | ACL setzen (ICE `setACL()`) |
+| GET    | `/v1/servers/{cid}/bans` | Aktive Bans (ICE `getBans()`) |
+| PUT    | `/v1/servers/{cid}/bans` | Bans setzen (ICE `setBans()`) |
+| PATCH  | `/v1/servers/{cid}/live` | Einstellungen live ändern (ICE `setConf()`) |
 
 Alle Antworten haben das Format `{"ok": bool, ...}`.
 
-## Channel-Viewer
+## ZeroC ICE
 
-Der `/viewer`-Endpoint liest Channel-Daten und Online-User **ohne** sich als Mumble-Client einzuloggen — verbundene Nutzer sehen keine Ankündigungen:
+Ab v2.0.0 kommuniziert der Agent direkt mit dem laufenden Mumble-Prozess über **ZeroC ICE**. Der ICE-Port wird automatisch aus der Container-Konfiguration gelesen:
 
-- **Channel-Struktur** → direkt aus der SQLite-Datenbank des Containers (`docker exec sqlite3`)
-- **Online-User** → aus den Docker-Logs des Containers (parst `Authenticated`/`Connection closed`-Events)
+```
+MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502
+```
 
-Ergebnis wird 30 Sekunden gecacht.
+**Wichtig bei `--network host`**: Jeder Container muss einen eigenen ICE-Port bekommen, da sie sonst denselben Port auf dem Host belegen. Beim Erstellen `MUMBLE_CONFIG_ICE` explizit setzen (z.B. 6502, 6503, 6504…).
 
 ## Sicherheit
 
@@ -64,6 +87,7 @@ Ergebnis wird 30 Sekunden gecacht.
 - Docker
 - systemd
 - TLS-Reverse-Proxy (nginx, Caddy, Traefik)
+- `zeroc-ice` Python-Paket (wird via `pip install zeroc-ice` installiert; benötigt `libssl-dev`, `libbz2-dev`)
 
 ## Verzeichnisstruktur
 

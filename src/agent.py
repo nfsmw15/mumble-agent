@@ -1,24 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Andreas P. <https://nfsmw15.de>
 """
-mumble-agent v1.3.0
+mumble-agent v2.0.0
 
 FastAPI-Service zum Verwalten von Mumble-Servern als Docker-Container.
 
-Aenderung v1.2.2: Config/SuperUser-Zugriff ueber docker exec statt
-direktem Dateisystem-Zugriff (loest Mount-Namespace-Probleme).
-Aenderung v1.3.0: Channel-Viewer via minimalem Mumble-Protokoll-Client.
+v2.0.0: ZeroC-ICE-Integration fuer live Channel/User/ACL/Ban-Verwaltung.
+        Viewer, ACL, Channels, Kick, Bans via ICE ohne Server-Neustart.
+v1.3.0: Channel-Viewer via SQLite + Log-Parsing.
+v1.2.2: Config/SuperUser via docker exec.
 """
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import secrets
 import string
-import subprocess
+import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stderr
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,23 +30,49 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "1.3.0"
+AGENT_VERSION = "2.0.0"
 
-AGENT_TOKEN = os.environ.get("MUMBLE_AGENT_TOKEN", "")
-DOCKER_IMAGE = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:latest")
+AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
+DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:latest")
 DOCKER_NETWORK = os.environ.get("MUMBLE_AGENT_NETWORK", "host")
-DATA_ROOT = os.environ.get("MUMBLE_AGENT_DATA", "/var/lib/mumble-agent")
-LABEL_KEY = "mumble-agent.managed"
-INI_PATH_IN_CONTAINER = "/data/mumble_server_config.ini"
+DATA_ROOT      = os.environ.get("MUMBLE_AGENT_DATA", "/var/lib/mumble-agent")
+LABEL_KEY      = "mumble-agent.managed"
+INI_PATH       = "/data/mumble_server_config.ini"
 
 if not AGENT_TOKEN:
     raise RuntimeError("MUMBLE_AGENT_TOKEN nicht gesetzt.")
 
 docker_client: docker.DockerClient | None = None
 
+# ── ICE-Setup ────────────────────────────────────────────────────────────────
+_MumbleServer = None   # nach _init_ice() gesetzt
+_ICE_SLICE    = os.path.join(os.path.dirname(__file__), "MumbleServer.ice")
+
+def _init_ice() -> None:
+    global _MumbleServer
+    if not os.path.exists(_ICE_SLICE):
+        print(f"[mumble-agent] MumbleServer.ice nicht gefunden: {_ICE_SLICE}", flush=True)
+        return
+    try:
+        import Ice
+        # Slice-Include-Pfad ermitteln
+        site_pkg = os.path.dirname(os.path.dirname(Ice.__file__))
+        include  = os.path.join(site_pkg, "slice")
+        if not os.path.isdir(include):
+            include = site_pkg
+        # loadSlice-Warnungen (veraltete Slice-Syntax) unterdrücken
+        with redirect_stderr(io.StringIO()):
+            Ice.loadSlice(["-I", include, _ICE_SLICE])
+        import MumbleServer as _ms
+        _MumbleServer = _ms
+        print(f"[mumble-agent] ICE bereit (zeroc-ice, Slice={_ICE_SLICE})", flush=True)
+    except Exception as e:
+        print(f"[mumble-agent] ICE nicht verfügbar: {e}", flush=True)
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global docker_client
+    _init_ice()
     docker_client = docker.from_env()
     os.makedirs(DATA_ROOT, mode=0o750, exist_ok=True)
     yield
@@ -53,56 +81,103 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="mumble-agent", version=AGENT_VERSION, lifespan=lifespan)
 
-def check_token(authorization: str | None) -> None:
-    if not authorization:
-        raise HTTPException(401, detail="missing authorization")
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(401, detail="invalid auth scheme")
-    if not secrets.compare_digest(authorization[7:].strip(), AGENT_TOKEN):
-        raise HTTPException(403, detail="invalid token")
 
-# --- Modelle ---
+def _ice_port_for(c) -> int:
+    """ICE-Port aus Container-Config lesen; Fallback = 6502 (Mumble-Standard)."""
+    try:
+        # Lese die ice=... Zeile aus der INI — unterstützt ice=tcp... und ice="tcp..."
+        res = c.exec_run(
+            ["sh", "-c",
+             "grep '^ice=' /data/mumble_server_config.ini | grep -oP '(?<=-p )\\d+'"],
+            demux=False,
+        )
+        if res.exit_code == 0 and res.output:
+            port = int(res.output.decode().strip())
+            if 1 <= port <= 65535:
+                return port
+    except Exception:
+        pass
+    return 6502
+
+
+def _ice_connect(ice_port: int):
+    """
+    Verbindet per ICE mit Murmur, gibt (communicator, ServerPrx) zurück.
+    Caller muss comm.destroy() aufrufen.
+    Raises HTTPException(503) falls ICE nicht verfügbar.
+    """
+    if _MumbleServer is None:
+        raise HTTPException(503, detail="ICE nicht initialisiert (MumbleServer.ice fehlt?)")
+    import Ice
+    comm = Ice.initialize()
+    try:
+        base = comm.stringToProxy(f"Meta:tcp -h 127.0.0.1 -p {ice_port} -t 5000")
+        meta = _MumbleServer.MetaPrx.checkedCast(base)
+        if not meta:
+            comm.destroy()
+            raise HTTPException(503, detail="ICE nicht erreichbar – ICE in Mumble-Config aktivieren")
+        servers = meta.getBootedServers()
+        if not servers:
+            comm.destroy()
+            raise HTTPException(503, detail="Mumble-Server nicht gebootet")
+        return comm, servers[0]
+    except Ice.ConnectionRefusedException:
+        comm.destroy()
+        raise HTTPException(503, detail=f"ICE-Verbindung verweigert (Port {ice_port}) – ICE aktivieren")
+    except Ice.TimeoutException:
+        comm.destroy()
+        raise HTTPException(503, detail=f"ICE-Timeout (Port {ice_port}) – Server läuft oder ICE nicht aktiv?")
+    except HTTPException:
+        raise
+    except Exception as e:
+        comm.destroy()
+        raise HTTPException(503, detail=f"ICE-Fehler: {e}")
+
+
+# ── Pydantic-Modelle ──────────────────────────────────────────────────────────
+
 class CreateServerRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
-    port: int = Field(ge=1024, le=65535)
-    password: str = Field(default="", max_length=128)
-    max_users: int = Field(default=10, ge=1, le=500)
+    name: str         = Field(min_length=1, max_length=64)
+    port: int         = Field(ge=1024, le=65535)
+    password: str     = Field(default="", max_length=128)
+    max_users: int    = Field(default=10, ge=1, le=500)
     welcome_text: str = Field(default="", max_length=2000)
-    external_id: int = Field(default=0)
+    external_id: int  = Field(default=0)
 
 class UpdateServerRequest(BaseModel):
-    # Basis
-    name: str | None             = Field(default=None, max_length=64)
-    password: str | None         = Field(default=None, max_length=128)
-    max_users: int | None        = Field(default=None, ge=1, le=500)
-    welcome_text: str | None     = Field(default=None, max_length=2000)
-    # Tab: Basis
-    bandwidth: int | None        = Field(default=None, ge=8000, le=1000000)
-    timeout: int | None          = Field(default=None, ge=5, le=3600)
-    textmessagelength: int | None = Field(default=None, ge=0, le=100000)
+    name: str | None          = Field(default=None, max_length=64)
+    password: str | None      = Field(default=None, max_length=128)
+    max_users: int | None     = Field(default=None, ge=1, le=500)
+    welcome_text: str | None  = Field(default=None, max_length=2000)
+    bandwidth: int | None     = Field(default=None, ge=8000, le=1000000)
+    timeout: int | None       = Field(default=None, ge=5, le=3600)
+    textmessagelength: int | None  = Field(default=None, ge=0, le=100000)
     imagemessagelength: int | None = Field(default=None, ge=0, le=10485760)
-    allowhtml: bool | None       = Field(default=None)
-    opusthreshold: int | None    = Field(default=None, ge=0, le=100)
-    defaultchannel: int | None   = Field(default=None, ge=0)
+    allowhtml: bool | None    = Field(default=None)
+    opusthreshold: int | None = Field(default=None, ge=0, le=100)
+    defaultchannel: int | None = Field(default=None, ge=0)
     rememberchannel: bool | None = Field(default=None)
-    certrequired: bool | None    = Field(default=None)
-    usersperchannel: int | None  = Field(default=None, ge=0, le=500)
-    # Tab: Registrierung
+    certrequired: bool | None = Field(default=None)
+    usersperchannel: int | None = Field(default=None, ge=0, le=500)
     register_name: str | None    = Field(default=None, max_length=255)
     register_password: str | None = Field(default=None, max_length=255)
     register_url: str | None     = Field(default=None, max_length=512)
     register_hostname: str | None = Field(default=None, max_length=255)
     register_location: str | None = Field(default=None, max_length=64)
-    # Tab: Auto-Ban
     autoban_attempts: int | None  = Field(default=None, ge=0)
     autoban_timeframe: int | None = Field(default=None, ge=0)
     autoban_time: int | None      = Field(default=None, ge=0)
-    # Tab: Erweitert
     sendversion: bool | None     = Field(default=None)
     bonjour: bool | None         = Field(default=None)
     suggestversion: str | None   = Field(default=None, max_length=32)
     suggestpositional: bool | None = Field(default=None)
     suggestpushtotalk: bool | None = Field(default=None)
+
+class LiveSettingsRequest(BaseModel):
+    name: str | None         = Field(default=None, max_length=64)
+    password: str | None     = Field(default=None, max_length=128)
+    max_users: int | None    = Field(default=None, ge=1, le=500)
+    welcome_text: str | None = Field(default=None, max_length=2000)
 
 class CertificateRequest(BaseModel):
     cert: str = Field(min_length=50, max_length=65536)
@@ -114,61 +189,132 @@ class SuperUserResetRequest(BaseModel):
 class ConfigUpdateRequest(BaseModel):
     content: str = Field(min_length=10, max_length=64000)
 
-# --- Helpers ---
+class AclEntryModel(BaseModel):
+    user_id: int | None = Field(default=None)
+    group: str | None   = Field(default=None, max_length=64)
+    apply_here: bool    = Field(default=True)
+    apply_sub: bool     = Field(default=True)
+    grant: int          = Field(default=0, ge=0)
+    deny: int           = Field(default=0, ge=0)
+
+class AclGroupModel(BaseModel):
+    name: str                  = Field(min_length=1, max_length=64)
+    inherit: bool              = Field(default=True)
+    inheritable: bool          = Field(default=True)
+    members_add: list[int]     = Field(default_factory=list)
+    members_remove: list[int]  = Field(default_factory=list)
+
+class SetAclRequest(BaseModel):
+    channel_id: int              = Field(ge=0)
+    inherit_acl: bool            = Field(default=True)
+    acl: list[AclEntryModel]     = Field(default_factory=list)
+    groups: list[AclGroupModel]  = Field(default_factory=list)
+
+class AddChannelRequest(BaseModel):
+    name: str   = Field(min_length=1, max_length=64)
+    parent: int = Field(default=0, ge=0)
+
+class UpdateChannelRequest(BaseModel):
+    name: str | None        = Field(default=None, max_length=64)
+    description: str | None = Field(default=None, max_length=2000)
+    position: int | None    = Field(default=None)
+    parent: int | None      = Field(default=None, ge=0)
+
+class KickRequest(BaseModel):
+    reason: str = Field(default="", max_length=256)
+
+class UpdateUserRequest(BaseModel):
+    mute: bool | None       = Field(default=None)
+    deaf: bool | None       = Field(default=None)
+    channel: int | None     = Field(default=None, ge=0)
+
+class BanEntry(BaseModel):
+    address: str    = Field(description="IPv4 oder IPv6-Adresse")
+    bits: int       = Field(default=32, ge=1, le=128)
+    name: str       = Field(default="")
+    reason: str     = Field(default="")
+    duration: int   = Field(default=0, ge=0, description="Sekunden, 0=permanent")
+
+class SetBansRequest(BaseModel):
+    bans: list[BanEntry] = Field(default_factory=list)
+
+
+# ── Docker-Helpers ────────────────────────────────────────────────────────────
+
+def check_token(authorization: str | None) -> None:
+    if not authorization:
+        raise HTTPException(401, detail="missing authorization")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, detail="invalid auth scheme")
+    if not secrets.compare_digest(authorization[7:].strip(), AGENT_TOKEN):
+        raise HTTPException(403, detail="invalid token")
+
 def _container_name(external_id: int, port: int) -> str:
     return f"mumble-{external_id}-{port}" if external_id else f"mumble-{port}"
 
 def _data_dir(name: str) -> str:
     return os.path.join(DATA_ROOT, name.lstrip("/"))
 
-def _config_for(req: CreateServerRequest) -> dict[str, str]:
-    cfg = {
-        "MUMBLE_CONFIG_REGISTER_NAME": req.name,
-        "MUMBLE_CONFIG_USERS": str(req.max_users),
-        "MUMBLE_CONFIG_WELCOMETEXT": req.welcome_text or "Willkommen!",
-        "MUMBLE_CONFIG_PORT": str(req.port),
-    }
-    if req.password:
-        cfg["MUMBLE_CONFIG_SERVERPASSWORD"] = req.password
-    return cfg
-
 def _require_managed(c) -> None:
     if c.labels.get(LABEL_KEY) != "1":
         raise HTTPException(403, detail="container is not managed by mumble-agent")
 
 def _generate_password(length: int = 16) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
+    return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(length))
+
+def _config_for(req: CreateServerRequest) -> dict[str, str]:
+    port = req.port
+    cfg = {
+        "MUMBLE_CONFIG_REGISTER_NAME": req.name,
+        "MUMBLE_CONFIG_USERS":         str(req.max_users),
+        "MUMBLE_CONFIG_WELCOMETEXT":   req.welcome_text or "Willkommen!",
+        "MUMBLE_CONFIG_PORT":          str(port),
+    }
+    if req.password:
+        cfg["MUMBLE_CONFIG_SERVERPASSWORD"] = req.password
+    return cfg
 
 _SUPERUSER_PW_RE = re.compile(r"Password for 'SuperUser' set to '([^']+)'")
 
-def _search_superuser_in_text(text: str) -> str | None:
+def _search_superuser(text: str) -> str | None:
     m = _SUPERUSER_PW_RE.search(text)
     return m.group(1) if m else None
 
-def _extract_superuser_from_logs(c, timeout: int = 30) -> str | None:
-    """Polls Docker logs for the SuperUser password log line.
-
-    Mumble logs this only on the very first start. After the polling window
-    expires, falls back to reading the log file from inside the container in
-    case Mumble is writing logs to a file instead of stdout/stderr.
-    """
+def _extract_superuser(c, timeout: int = 30) -> str | None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            logs = c.logs(tail=500, timestamps=False).decode("utf-8", errors="replace")
-            pw = _search_superuser_in_text(logs)
+            logs = c.logs(tail=500).decode("utf-8", errors="replace")
+            pw = _search_superuser(logs)
             if pw:
                 return pw
         except Exception:
             pass
         time.sleep(1)
-    # Fallback: Mumble may write logs to a file rather than stdout/stderr.
-    for log_path in ("/data/mumble-server.log", "/data/murmur.log"):
+    for path in ("/data/mumble-server.log", "/data/murmur.log"):
         try:
-            res = c.exec_run(["cat", log_path], demux=False)
+            res = c.exec_run(["cat", path], demux=False)
             if res.exit_code == 0 and res.output:
-                pw = _search_superuser_in_text(res.output.decode("utf-8", errors="replace"))
+                pw = _search_superuser(res.output.decode("utf-8", errors="replace"))
+                if pw:
+                    return pw
+        except Exception:
+            continue
+    return None
+
+def _read_superuser(c) -> str | None:
+    try:
+        logs = c.logs().decode("utf-8", errors="replace")
+        pw = _search_superuser(logs)
+        if pw:
+            return pw
+    except Exception:
+        pass
+    for path in ("/data/mumble-server.log", "/data/murmur.log"):
+        try:
+            res = c.exec_run(["cat", path], demux=False)
+            if res.exit_code == 0 and res.output:
+                pw = _search_superuser(res.output.decode("utf-8", errors="replace"))
                 if pw:
                     return pw
         except Exception:
@@ -192,210 +338,222 @@ def _patch_ini(ini_text: str, updates: dict[str, str]) -> str:
             out.append(f"{k}={v}")
     return "\n".join(out) + "\n"
 
-# --- Docker-exec basierte Config/SuperUser Helpers ---
-def _read_config_from_container(c) -> str:
-    """Liest die INI-Datei direkt aus dem Container via docker exec."""
-    try:
-        res = c.exec_run(["cat", INI_PATH_IN_CONTAINER], demux=False)
-        if res.exit_code != 0:
-            raise HTTPException(500, detail=f"cannot read config from container (exit {res.exit_code})")
-        return res.output.decode("utf-8", errors="replace")
-    except APIError as e:
-        raise HTTPException(500, detail=f"docker exec failed: {e}")
+def _read_config(c) -> str:
+    res = c.exec_run(["cat", INI_PATH], demux=False)
+    if res.exit_code != 0:
+        raise HTTPException(500, detail="cannot read config from container")
+    return res.output.decode("utf-8", errors="replace")
 
-def _write_config_to_container(c, content: str) -> None:
-    """Schreibt die INI-Datei in den Container via Docker put_archive API.
-    
-    Verwendet tar-Archiv statt Shell-Escaping — funktioniert zuverlässig
-    mit allen Sonderzeichen, Newlines und Umlauten.
-    """
-    import io
+def _write_config(c, content: str) -> None:
     import tarfile
     data = content.encode("utf-8")
-    tar_stream = io.BytesIO()
-    with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
         info = tarfile.TarInfo(name="mumble_server_config.ini")
         info.size = len(data)
-        info.uid = 10000
-        info.gid = 10000
+        info.uid = info.gid = 10000
         info.mode = 0o644
         tar.addfile(info, io.BytesIO(data))
-    tar_stream.seek(0)
+    buf.seek(0)
     try:
-        c.put_archive("/data", tar_stream)
+        c.put_archive("/data", buf)
     except APIError as e:
         raise HTTPException(500, detail=f"put_archive failed: {e}")
 
-def _read_superuser_from_container(c) -> str | None:
-    """Reads the SuperUser password from the full container log history.
+_SETTINGS_MAP = {
+    "MUMBLE_CONFIG_BANDWIDTH":         "bandwidth",
+    "MUMBLE_CONFIG_TIMEOUT":           "timeout",
+    "MUMBLE_CONFIG_TEXTMESSAGELENGTH": "textmessagelength",
+    "MUMBLE_CONFIG_IMAGEMESSAGELENGTH":"imagemessagelength",
+    "MUMBLE_CONFIG_ALLOWHTML":         "allowhtml",
+    "MUMBLE_CONFIG_OPUSTHRESHOLD":     "opusthreshold",
+    "MUMBLE_CONFIG_DEFAULTCHANNEL":    "defaultchannel",
+    "MUMBLE_CONFIG_REMEMBERCHANNEL":   "rememberchannel",
+    "MUMBLE_CONFIG_CERTREQUIRED":      "certrequired",
+    "MUMBLE_CONFIG_USERSPERCHANNEL":   "usersperchannel",
+    "MUMBLE_CONFIG_REGISTERNAME":      "register_name",
+    "MUMBLE_CONFIG_REGISTERPASSWORD":  "register_password",
+    "MUMBLE_CONFIG_REGISTERURL":       "register_url",
+    "MUMBLE_CONFIG_REGISTERHOSTNAME":  "register_hostname",
+    "MUMBLE_CONFIG_REGISTERLOCATION":  "register_location",
+    "MUMBLE_CONFIG_AUTOBANATTEMPTS":   "autoban_attempts",
+    "MUMBLE_CONFIG_AUTOBANTIMEFRAME":  "autoban_timeframe",
+    "MUMBLE_CONFIG_AUTOBANTIME":       "autoban_time",
+    "MUMBLE_CONFIG_SENDVERSION":       "sendversion",
+    "MUMBLE_CONFIG_BONJOUR":           "bonjour",
+    "MUMBLE_CONFIG_SUGGESTVERSION":    "suggestversion",
+    "MUMBLE_CONFIG_SUGGESTPOSITIONAL": "suggestpositional",
+    "MUMBLE_CONFIG_SUGGESTPUSHTOTALK": "suggestpushtotalk",
+    "MUMBLE_CONFIG_SSLCERT":           "ssl_cert",
+    "MUMBLE_CONFIG_SSLKEY":            "ssl_key",
+}
 
-    Unlike _extract_superuser_from_logs, this does not poll — it searches all
-    Docker logs at once (no tail limit), because the password was only logged
-    once at the very first start and may be hundreds of lines back in history.
-    Falls back to the log file inside the container.
-    """
-    try:
-        logs = c.logs(timestamps=False).decode("utf-8", errors="replace")
-        pw = _search_superuser_in_text(logs)
-        if pw:
-            return pw
-    except Exception:
-        pass
-    for log_path in ("/data/mumble-server.log", "/data/murmur.log"):
-        try:
-            res = c.exec_run(["cat", log_path], demux=False)
-            if res.exit_code == 0 and res.output:
-                pw = _search_superuser_in_text(res.output.decode("utf-8", errors="replace"))
-                if pw:
-                    return pw
-        except Exception:
-            continue
-    return None
-
-# --- Mumble Channel-Viewer (ohne Client-Connect — SQLite + Log-Parsing) ---
-# Channels: direkt aus der SQLite-DB via docker exec (kein Netzwerk-Connect)
-# Online-User: aus Docker-Logs parsen (Authenticated/Connection-closed Events)
-
-# Cache: {container_id -> (timestamp, result)}
-_viewer_cache: dict[str, tuple[float, dict]] = {}
-_VIEWER_CACHE_TTL = 10  # Sekunden
-
-# Log-Regex für User-Events — kein Mumble-Client-Connect nötig
-_LOG_AUTH_RE        = re.compile(r'=> <(\d+):([^(]+)\(\d+\)> Authenticated')
-_LOG_DISC_RE        = re.compile(r'=> <(\d+):[^(]+\(\d+\)> (?:Connection closed|Timeout|Disconnecting)')
-_LOG_BOOT_RE        = re.compile(r'Booting servers|Generating new tables')
-# "Moved NAME:session(uid) to CHANNEL[channel_id:parent_id]"
-_LOG_MOVE_RE        = re.compile(r'=> <\d+:[^>]+> Moved [^:]+:(\d+)\(\d+\) to [^\[]+\[(\d+):')
-# "Added channel NAME[channel_id:parent_id*?] under PARENT[...]"  — * = temporär
-# Gruppe 1=actor-session, 2=channel-name, 3=channel-id, 4=parent-id, 5=* wenn temporär
-_LOG_ADD_CHAN_RE     = re.compile(r'=> <(\d+):[^>]+> Added channel ([^\[]+)\[(\d+):(\d+)(\*)?\] under ')
-
-def _get_channels_from_db(c) -> dict[int, dict]:
-    """Liest Channel-Struktur direkt aus der SQLite-DB — kein Netzwerk-Connect."""
-    try:
-        res = c.exec_run(
-            ["sqlite3", "-readonly", "/data/mumble-server.sqlite",
-             "SELECT channel_id, parent_id, name FROM channels WHERE server_id=1;"],
-            demux=False
-        )
-        if res.exit_code != 0 or not res.output:
-            return {}
-        channels: dict[int, dict] = {}
-        for line in res.output.decode("utf-8", errors="replace").strip().splitlines():
-            parts = line.split("|")
-            if len(parts) < 3:
-                continue
-            cid = int(parts[0])
-            parent = int(parts[1]) if parts[1].strip() else None
-            name = parts[2]
-            channels[cid] = {"id": cid, "parent": parent, "name": name}
-        return channels
-    except Exception:
-        return {}
-
-def _parse_log_state(c, default_channel_id: int) -> tuple[dict[int, dict], dict[int, dict]]:
-    """Parst Docker-Logs: Online-User (session→{name,channel_id}) +
-       temporäre Channels (id→{id,parent,name}) die nicht in SQLite stehen."""
-    try:
-        logs = c.logs(timestamps=False).decode("utf-8", errors="replace")
-    except Exception:
-        return {}, {}
-    lines = logs.splitlines()
-    last_boot = 0
-    for i, line in enumerate(lines):
-        if _LOG_BOOT_RE.search(line):
-            last_boot = i
-    online:    dict[int, dict] = {}
-    temp_chans: dict[int, dict] = {}
-    for line in lines[last_boot:]:
-        m = _LOG_AUTH_RE.search(line)
-        if m:
-            online[int(m.group(1))] = {"name": m.group(2).strip(), "channel_id": default_channel_id}
-            continue
-        m = _LOG_MOVE_RE.search(line)
-        if m:
-            sid = int(m.group(1))
-            if sid in online:
-                online[sid]["channel_id"] = int(m.group(2))
-            continue
-        m = _LOG_ADD_CHAN_RE.search(line)
-        if m:
-            actor_sid = int(m.group(1))
-            cid       = int(m.group(3))
-            parent    = int(m.group(4))
-            is_tmp    = m.group(5) == "*"
-            if is_tmp:
-                temp_chans[cid] = {"id": cid, "parent": parent, "name": m.group(2).strip()}
-                # Temp-Channel erstellen = in der Regel auch betreten (kein separater Move geloggt)
-                if actor_sid in online:
-                    online[actor_sid]["channel_id"] = cid
-            continue
-        m = _LOG_DISC_RE.search(line)
-        if m:
-            online.pop(int(m.group(1)), None)
-    # Temporäre Channels entfernen die keine User mehr haben
-    occupied = {v["channel_id"] for v in online.values()}
-    temp_chans = {k: v for k, v in temp_chans.items() if k in occupied}
-    return online, temp_chans
-
-def get_mumble_viewer(c) -> dict:
-    """Channel-Baum + Online-User — vollständig ohne Mumble-Client-Connect."""
-    now = time.time()
-    if c.id in _viewer_cache:
-        ts, cached = _viewer_cache[c.id]
-        if now - ts < _VIEWER_CACHE_TTL:
-            return cached
-
-    channels = _get_channels_from_db(c)
-
-    # Default-Channel aus Container-ENV lesen
-    default_channel_id = 0
+def _env_map(c) -> dict[str, str]:
+    env = {}
     for item in (c.attrs.get("Config", {}).get("Env") or []):
-        if item.startswith("MUMBLE_CONFIG_DEFAULTCHANNEL="):
-            try:
-                default_channel_id = int(item.split("=", 1)[1])
-            except (ValueError, IndexError):
-                pass
+        if "=" in item:
+            k, v = item.split("=", 1)
+            env[k] = v
+    return env
 
-    online, temp_chans = _parse_log_state(c, default_channel_id)
-    # Temporäre Channels (nur in Memory, nicht in SQLite) ergänzen
-    all_channels = {**channels, **temp_chans}
+def _recreate_container(c, new_env: dict[str, str]) -> docker.models.containers.Container:
+    old_labels = c.labels.copy()
+    old_name   = c.name.lstrip("/")
+    old_port   = old_labels.get("mumble-agent.port", "")
+    data_dir   = _data_dir(old_name)
+    port_int   = int(old_port) if old_port.isdigit() else 64738
+    try:
+        c.stop(timeout=10)
+        c.remove(force=True)
+    except APIError as e:
+        raise HTTPException(500, detail=f"container remove failed: {e}")
+    try:
+        return docker_client.containers.run(
+            image=DOCKER_IMAGE, name=old_name, detach=True,
+            restart_policy={"Name": "unless-stopped"},
+            environment=new_env,
+            volumes={data_dir: {"bind": "/data", "mode": "rw"}},
+            ports=(None if DOCKER_NETWORK == "host"
+                   else {f"{port_int}/tcp": port_int, f"{port_int}/udp": port_int}),
+            network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
+            labels=old_labels,
+        )
+    except APIError as e:
+        raise HTTPException(500, detail=f"container create failed: {e}")
 
-    def build_tree(parent_id: int | None) -> list:
-        children = []
-        for ch in sorted(all_channels.values(), key=lambda x: x["name"].lower()):
-            if ch["parent"] == parent_id and ch["id"] != 0:
-                ch_users = [v["name"] for v in online.values() if v["channel_id"] == ch["id"]]
-                children.append({
-                    "id": ch["id"],
-                    "name": ch["name"],
-                    "users": ch_users,
-                    "children": build_tree(ch["id"]),
-                })
-        return children
 
-    root_users = [v["name"] for v in online.values() if v["channel_id"] == 0]
-    root_name = all_channels.get(0, {}).get("name") or "Root"
-    root = {"id": 0, "name": root_name, "users": root_users, "children": build_tree(0)}
-    result = {"ok": True, "channels": root, "user_count": len(online)}
-    _viewer_cache[c.id] = (now, result)
-    return result
+# ── ICE-Daten-Konverter ───────────────────────────────────────────────────────
 
-# --- Endpoints ---
+def _tree_to_dict(tree) -> dict:
+    return {
+        "id":       tree.c.id,
+        "name":     tree.c.name,
+        "users":    [_user_to_dict(u) for u in tree.users],
+        "children": [_tree_to_dict(ch) for ch in tree.children],
+    }
+
+def _user_to_dict(u) -> dict:
+    return {
+        "session":   u.session,
+        "name":      u.name,
+        "userid":    u.userid,
+        "channel":   u.channel,
+        "mute":      u.mute,
+        "deaf":      u.deaf,
+        "self_mute": u.selfMute,
+        "self_deaf": u.selfDeaf,
+        "recording": u.recording,
+        "idle":      u.idlesecs,
+    }
+
+def _channel_to_dict(ch) -> dict:
+    return {
+        "id":          ch.id,
+        "name":        ch.name,
+        "parent":      ch.parent,
+        "description": ch.description,
+        "temporary":   ch.temporary,
+        "position":    ch.position,
+        "links":       list(ch.links),
+    }
+
+def _acl_to_dict(a) -> dict:
+    return {
+        "user_id":    None if a.userid == -1 else a.userid,
+        "group":      a.group if a.group else None,
+        "apply_here": a.applyHere,
+        "apply_sub":  a.applySubs,
+        "inherited":  a.inherited,
+        "grant":      a.allow,
+        "deny":       a.deny,
+    }
+
+def _group_to_dict(g) -> dict:
+    return {
+        "name":           g.name,
+        "inherit":        g.inherit,
+        "inheritable":    g.inheritable,
+        "inherited":      g.inherited,
+        "members_add":    list(g.add),
+        "members_remove": list(g.remove),
+        "members":        list(g.members),
+    }
+
+def _ban_to_dict(b) -> dict:
+    import socket, struct
+    try:
+        raw = bytes(b.address)
+        # IPv4-mapped IPv6 → IPv4
+        if len(raw) == 16 and raw[:12] == b'\x00'*10 + b'\xff\xff':
+            addr = socket.inet_ntop(socket.AF_INET, raw[12:])
+        elif len(raw) == 4:
+            addr = socket.inet_ntop(socket.AF_INET, raw)
+        else:
+            addr = socket.inet_ntop(socket.AF_INET6, raw)
+    except Exception:
+        addr = str(bytes(b.address))
+    return {
+        "address":  addr,
+        "bits":     b.bits,
+        "name":     b.name,
+        "hash":     b.hash,
+        "reason":   b.reason,
+        "start":    b.start,
+        "duration": b.duration,
+    }
+
+def _ice_acl_entry(a: AclEntryModel):
+    acl = _MumbleServer.ACL()
+    acl.userid    = -1 if a.user_id is None else a.user_id
+    acl.group     = a.group or ""
+    acl.applyHere = a.apply_here
+    acl.applySubs = a.apply_sub
+    acl.inherited = False
+    acl.allow     = a.grant
+    acl.deny      = a.deny
+    return acl
+
+def _ice_group(g: AclGroupModel):
+    grp = _MumbleServer.Group()
+    grp.name        = g.name
+    grp.inherit     = g.inherit
+    grp.inheritable = g.inheritable
+    grp.inherited   = False
+    grp.add         = list(g.members_add)
+    grp.remove      = list(g.members_remove)
+    grp.members     = []
+    return grp
+
+def _addr_to_bytes(addr: str) -> list[int]:
+    import socket
+    try:
+        # Versuche IPv4
+        raw = socket.inet_pton(socket.AF_INET, addr)
+        # Als IPv4-mapped IPv6 speichern
+        return list(b'\x00'*10 + b'\xff\xff' + raw)
+    except OSError:
+        raw = socket.inet_pton(socket.AF_INET6, addr)
+        return list(raw)
+
+
+# ── Endpoints: Ping + Server-Lifecycle ────────────────────────────────────────
+
 @app.get("/v1/ping")
 async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     return {
         "ok": True, "agent": "mumble-agent", "version": AGENT_VERSION,
+        "ice": _MumbleServer is not None,
         "time": int(time.time()),
         "docker_version": docker_client.version().get("Version") if docker_client else None,
     }
 
 @app.post("/v1/servers")
-async def create_server(req: CreateServerRequest, authorization: str = Header(default=None)) -> dict[str, Any]:
+async def create_server(req: CreateServerRequest,
+                        authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
-    name = _container_name(req.external_id, req.port)
+    name     = _container_name(req.external_id, req.port)
     data_dir = _data_dir(name)
     os.makedirs(data_dir, mode=0o750, exist_ok=True)
     try:
@@ -408,16 +566,17 @@ async def create_server(req: CreateServerRequest, authorization: str = Header(de
                    else {f"{req.port}/tcp": req.port, f"{req.port}/udp": req.port}),
             network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
             labels={
-                LABEL_KEY: "1",
-                "mumble-agent.external_id": str(req.external_id),
-                "mumble-agent.port": str(req.port),
-                "mumble-agent.name": req.name,
+                LABEL_KEY:                    "1",
+                "mumble-agent.external_id":   str(req.external_id),
+                "mumble-agent.port":          str(req.port),
+                "mumble-agent.name":          req.name,
             },
         )
     except APIError as e:
         raise HTTPException(500, detail=f"docker error: {e.explanation or str(e)}")
-    superuser_pw = _extract_superuser_from_logs(c, timeout=30)
-    return {"ok": True, "container_id": c.id, "name": c.name, "superuser_password": superuser_pw}
+    superuser_pw = _extract_superuser(c, timeout=30)
+    return {"ok": True, "container_id": c.id, "name": c.name,
+            "superuser_password": superuser_pw}
 
 @app.delete("/v1/servers/{cid}")
 async def delete_server(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
@@ -479,44 +638,12 @@ async def restart_server(cid: str, authorization: str = Header(default=None)) ->
         raise HTTPException(500, detail=str(e))
     return {"ok": True}
 
-@app.get("/v1/servers/{cid}/stats")
-async def server_stats(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    check_token(authorization)
-    assert docker_client is not None
-    try:
-        c = docker_client.containers.get(cid)
-        _require_managed(c)
-    except NotFound:
-        raise HTTPException(404, detail="container not found")
-    started_at = c.attrs.get("State", {}).get("StartedAt", "")
-    uptime = 0
-    if started_at and c.status == "running":
-        try:
-            ts = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-            uptime = int((datetime.now(timezone.utc) - ts).total_seconds())
-        except Exception:
-            uptime = 0
-    online = 0
-    try:
-        default_channel_id = 0
-        for item in (c.attrs.get("Config", {}).get("Env") or []):
-            if item.startswith("MUMBLE_CONFIG_DEFAULTCHANNEL="):
-                try:
-                    default_channel_id = int(item.split("=", 1)[1])
-                except (ValueError, IndexError):
-                    pass
-        parsed_users, _ = _parse_log_state(c, default_channel_id)
-        online = len(parsed_users)
-    except Exception:
-        pass
-    return {"ok": True, "online": online, "uptime": uptime,
-            "status": c.status, "started_at": started_at}
-
 @app.get("/v1/servers/{cid}/logs")
-async def server_logs(cid: str, tail: int = 200, authorization: str = Header(default=None)) -> dict[str, Any]:
+async def server_logs(cid: str, tail: int = 200,
+                      authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
-    tail = max(10, min(2000, int(tail)))
+    tail = max(10, min(2000, tail))
     try:
         c = docker_client.containers.get(cid)
         _require_managed(c)
@@ -527,17 +654,11 @@ async def server_logs(cid: str, tail: int = 200, authorization: str = Header(def
         raise HTTPException(500, detail=str(e))
     return {"ok": True, "log": log, "tail": tail}
 
-@app.patch("/v1/servers/{cid}")
-async def update_server(cid: str, req: UpdateServerRequest, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Aktualisiert Server-Einstellungen durch Container-Recreate.
-    
-    Das Mumble-Docker-Image generiert die INI bei jedem Start aus den
-    ENV-Variablen. Deshalb reicht INI-patchen + Restart nicht — der
-    Container muss mit neuen ENV-Variablen neu erstellt werden.
-    
-    Das Volume (/data) bleibt erhalten: SQLite-DB, Zertifikate und
-    registrierte User gehen nicht verloren.
-    """
+
+# ── Endpoints: Stats + Viewer (via ICE) ───────────────────────────────────────
+
+@app.get("/v1/servers/{cid}/stats")
+async def server_stats(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -546,115 +667,343 @@ async def update_server(cid: str, req: UpdateServerRequest, authorization: str =
     except NotFound:
         raise HTTPException(404, detail="container not found")
 
-    # Aktuelle Config aus den bestehenden ENV-Variablen und Labels lesen
-    old_env = {}
+    started_at = c.attrs.get("State", {}).get("StartedAt", "")
+    uptime = 0
+    if started_at and c.status == "running":
+        try:
+            ts = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            uptime = int((datetime.now(timezone.utc) - ts).total_seconds())
+        except Exception:
+            pass
+
+    online = 0
+    if c.status == "running" and _MumbleServer:
+        try:
+            comm, srv = _ice_connect(_ice_port_for(c))
+            try:
+                online = len(srv.getUsers())
+            finally:
+                comm.destroy()
+        except Exception:
+            pass
+
+    return {"ok": True, "online": online, "uptime": uptime,
+            "status": c.status, "started_at": started_at}
+
+@app.get("/v1/servers/{cid}/viewer")
+async def channel_viewer(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Channel-Baum + Online-User via ICE (live, exakt)."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    if c.status != "running":
+        raise HTTPException(409, detail="server not running")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        tree  = srv.getTree()
+        users = srv.getUsers()
+        return {
+            "ok":         True,
+            "channels":   _tree_to_dict(tree),
+            "user_count": len(users),
+        }
+    finally:
+        comm.destroy()
+
+
+# ── Endpoints: Live-User-Verwaltung ──────────────────────────────────────────
+
+@app.get("/v1/servers/{cid}/users")
+async def get_users(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        users = srv.getUsers()
+        return {"ok": True, "users": {str(k): _user_to_dict(v) for k, v in users.items()}}
+    finally:
+        comm.destroy()
+
+@app.post("/v1/servers/{cid}/users/{session}/kick")
+async def kick_user(cid: str, session: int, req: KickRequest,
+                    authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        srv.kickUser(session, req.reason)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, detail=f"kick fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+@app.patch("/v1/servers/{cid}/users/{session}")
+async def update_user(cid: str, session: int, req: UpdateUserRequest,
+                      authorization: str = Header(default=None)) -> dict[str, Any]:
+    """User stummschalten, taubschalten oder in Channel verschieben."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        users = srv.getUsers()
+        if session not in users:
+            raise HTTPException(404, detail="user session not found")
+        state = users[session]
+        if req.mute   is not None: state.mute    = req.mute
+        if req.deaf   is not None: state.deaf    = req.deaf
+        if req.channel is not None: state.channel = req.channel
+        srv.setState(state)
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, detail=f"setState fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+
+# ── Endpoints: Channel-Verwaltung ─────────────────────────────────────────────
+
+@app.get("/v1/servers/{cid}/channels")
+async def get_channels(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        channels = srv.getChannels()
+        return {"ok": True, "channels": {str(k): _channel_to_dict(v) for k, v in channels.items()}}
+    finally:
+        comm.destroy()
+
+@app.post("/v1/servers/{cid}/channels")
+async def add_channel(cid: str, req: AddChannelRequest,
+                      authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        channel_id = srv.addChannel(req.name, req.parent)
+        return {"ok": True, "channel_id": channel_id}
+    except Exception as e:
+        raise HTTPException(500, detail=f"addChannel fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+@app.patch("/v1/servers/{cid}/channels/{channel_id}")
+async def update_channel(cid: str, channel_id: int, req: UpdateChannelRequest,
+                         authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        channels = srv.getChannels()
+        if channel_id not in channels:
+            raise HTTPException(404, detail="channel not found")
+        ch = channels[channel_id]
+        if req.name        is not None: ch.name        = req.name
+        if req.description is not None: ch.description = req.description
+        if req.position    is not None: ch.position    = req.position
+        if req.parent      is not None: ch.parent      = req.parent
+        srv.setChannelState(ch)
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, detail=f"setChannelState fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+@app.delete("/v1/servers/{cid}/channels/{channel_id}")
+async def remove_channel(cid: str, channel_id: int,
+                         authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        srv.removeChannel(channel_id)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, detail=f"removeChannel fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+
+# ── Endpoints: ACL (via ICE, kein Neustart) ────────────────────────────────
+
+@app.get("/v1/servers/{cid}/acl")
+async def get_acl(cid: str, channel_id: int = 0,
+                  authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        acls, groups, inherit = srv.getACL(channel_id)
+        reg = srv.getRegisteredUsers("")
+        return {
+            "ok":               True,
+            "channel_id":       channel_id,
+            "inherit_acl":      inherit,
+            "acl":              [_acl_to_dict(a) for a in acls],
+            "groups":           [_group_to_dict(g) for g in groups],
+            "registered_users": [{"id": uid, "name": name} for uid, name in reg.items()],
+        }
+    finally:
+        comm.destroy()
+
+@app.put("/v1/servers/{cid}/acl")
+async def set_acl(cid: str, req: SetAclRequest,
+                  authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Setzt ACL via ICE — kein Neustart nötig."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        acls   = [_ice_acl_entry(a) for a in req.acl]
+        groups = [_ice_group(g)     for g in req.groups]
+        srv.setACL(req.channel_id, acls, groups, req.inherit_acl)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, detail=f"setACL fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+
+# ── Endpoints: Ban-Verwaltung ─────────────────────────────────────────────────
+
+@app.get("/v1/servers/{cid}/bans")
+async def get_bans(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        bans = srv.getBans()
+        return {"ok": True, "bans": [_ban_to_dict(b) for b in bans]}
+    finally:
+        comm.destroy()
+
+@app.put("/v1/servers/{cid}/bans")
+async def set_bans(cid: str, req: SetBansRequest,
+                   authorization: str = Header(default=None)) -> dict[str, Any]:
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        ice_bans = []
+        for b in req.bans:
+            ban          = _MumbleServer.Ban()
+            ban.address  = _addr_to_bytes(b.address)
+            ban.bits     = b.bits
+            ban.name     = b.name
+            ban.reason   = b.reason
+            ban.duration = b.duration
+            ban.start    = int(time.time())
+            ban.hash     = ""
+            ice_bans.append(ban)
+        srv.setBans(ice_bans)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, detail=f"setBans fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+
+# ── Endpoints: ICE aktivieren ─────────────────────────────────────────────────
+
+@app.post("/v1/servers/{cid}/ice/enable")
+async def enable_ice(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    """
+    Aktiviert ICE für einen bestehenden Container.
+    Schreibt ice=tcp -h 127.0.0.1 -p {port+10000} in die INI und startet neu.
+    """
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    mumble_port = 64738
     for item in (c.attrs.get("Config", {}).get("Env") or []):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            old_env[k] = v
-
-    old_labels = c.labels.copy()
-    old_name = c.name.lstrip("/")
-    old_port = old_labels.get("mumble-agent.port", "")
-    old_ext_id = old_labels.get("mumble-agent.external_id", "0")
-    data_dir = _data_dir(old_name)
-
-    # Neue ENV-Werte zusammenbauen (altes übernehmen, mit Updates überschreiben)
-    new_env = dict(old_env)
-    updated = []
-
-    def _set(env_key: str, value: Any, field: str, as_str: bool = True) -> None:
-        if as_str:
-            new_env[env_key] = str(value)
-        else:
-            new_env[env_key] = value
-        updated.append(field)
-
-    def _set_bool(env_key: str, value: bool | None, field: str) -> None:
-        if value is None: return
-        new_env[env_key] = "true" if value else "false"
-        updated.append(field)
-
-    def _set_opt(env_key: str, value: Any, field: str) -> None:
-        """Setzt oder entfernt einen optionalen ENV-Wert."""
-        if value:
-            new_env[env_key] = str(value)
-        else:
-            new_env.pop(env_key, None)
-        updated.append(field)
-
-    if req.name is not None:
-        new_env["MUMBLE_CONFIG_REGISTER_NAME"] = req.name
-        old_labels["mumble-agent.name"] = req.name
-        updated.append("name")
-    if req.welcome_text is not None:
-        _set_opt("MUMBLE_CONFIG_WELCOMETEXT", req.welcome_text, "welcome_text")
-    if req.max_users is not None:
-        _set("MUMBLE_CONFIG_USERS", req.max_users, "max_users")
-    if req.password is not None:
-        _set_opt("MUMBLE_CONFIG_SERVERPASSWORD", req.password, "password")
-    # Tab: Basis
-    if req.bandwidth is not None:        _set("MUMBLE_CONFIG_BANDWIDTH", req.bandwidth, "bandwidth")
-    if req.timeout is not None:          _set("MUMBLE_CONFIG_TIMEOUT", req.timeout, "timeout")
-    if req.textmessagelength is not None: _set("MUMBLE_CONFIG_TEXTMESSAGELENGTH", req.textmessagelength, "textmessagelength")
-    if req.imagemessagelength is not None: _set("MUMBLE_CONFIG_IMAGEMESSAGELENGTH", req.imagemessagelength, "imagemessagelength")
-    if req.allowhtml is not None:        _set_bool("MUMBLE_CONFIG_ALLOWHTML", req.allowhtml, "allowhtml")
-    if req.opusthreshold is not None:    _set("MUMBLE_CONFIG_OPUSTHRESHOLD", req.opusthreshold, "opusthreshold")
-    if req.defaultchannel is not None:   _set("MUMBLE_CONFIG_DEFAULTCHANNEL", req.defaultchannel, "defaultchannel")
-    if req.rememberchannel is not None:  _set_bool("MUMBLE_CONFIG_REMEMBERCHANNEL", req.rememberchannel, "rememberchannel")
-    if req.certrequired is not None:     _set_bool("MUMBLE_CONFIG_CERTREQUIRED", req.certrequired, "certrequired")
-    if req.usersperchannel is not None:  _set("MUMBLE_CONFIG_USERSPERCHANNEL", req.usersperchannel, "usersperchannel")
-    # Tab: Registrierung
-    if req.register_name is not None:     _set_opt("MUMBLE_CONFIG_REGISTERNAME", req.register_name, "register_name")
-    if req.register_password is not None: _set_opt("MUMBLE_CONFIG_REGISTERPASSWORD", req.register_password, "register_password")
-    if req.register_url is not None:      _set_opt("MUMBLE_CONFIG_REGISTERURL", req.register_url, "register_url")
-    if req.register_hostname is not None: _set_opt("MUMBLE_CONFIG_REGISTERHOSTNAME", req.register_hostname, "register_hostname")
-    if req.register_location is not None: _set_opt("MUMBLE_CONFIG_REGISTERLOCATION", req.register_location, "register_location")
-    # Tab: Auto-Ban
-    if req.autoban_attempts is not None:  _set("MUMBLE_CONFIG_AUTOBANATTEMPTS", req.autoban_attempts, "autoban_attempts")
-    if req.autoban_timeframe is not None: _set("MUMBLE_CONFIG_AUTOBANTIMEFRAME", req.autoban_timeframe, "autoban_timeframe")
-    if req.autoban_time is not None:      _set("MUMBLE_CONFIG_AUTOBANTIME", req.autoban_time, "autoban_time")
-    # Tab: Erweitert
-    if req.sendversion is not None:       _set_bool("MUMBLE_CONFIG_SENDVERSION", req.sendversion, "sendversion")
-    if req.bonjour is not None:           _set_bool("MUMBLE_CONFIG_BONJOUR", req.bonjour, "bonjour")
-    if req.suggestversion is not None:    _set_opt("MUMBLE_CONFIG_SUGGESTVERSION", req.suggestversion, "suggestversion")
-    if req.suggestpositional is not None: _set_bool("MUMBLE_CONFIG_SUGGESTPOSITIONAL", req.suggestpositional, "suggestpositional")
-    if req.suggestpushtotalk is not None: _set_bool("MUMBLE_CONFIG_SUGGESTPUSHTOTALK", req.suggestpushtotalk, "suggestpushtotalk")
-
-    if not updated:
-        return {"ok": True, "note": "nothing to update"}
-
-    # Container stoppen und entfernen
+        if item.startswith("MUMBLE_CONFIG_PORT="):
+            try:
+                mumble_port = int(item.split("=", 1)[1].strip())
+            except (ValueError, IndexError):
+                pass
+    ice_port = mumble_port + 10000
+    ice_line = f"ice=tcp -h 127.0.0.1 -p {ice_port}"
+    ini = _read_config(c)
+    if "ice=" not in ini:
+        ini = ini.rstrip() + f"\n{ice_line}\n"
+        _write_config(c, ini)
     try:
-        c.stop(timeout=10)
-        c.remove(force=True)
+        c.restart(timeout=10)
     except APIError as e:
-        raise HTTPException(500, detail=f"cannot remove old container: {e}")
+        raise HTTPException(500, detail=f"Neustart fehlgeschlagen: {e}")
+    return {"ok": True, "ice_port": ice_port, "note": "ICE aktiviert, Server neugestartet"}
 
-    # Neuen Container mit denselben Einstellungen aber neuen ENV-Werten erstellen
-    port_int = int(old_port) if old_port.isdigit() else 64738
-    try:
-        new_c = docker_client.containers.run(
-            image=DOCKER_IMAGE, name=old_name, detach=True,
-            restart_policy={"Name": "unless-stopped"},
-            environment=new_env,
-            volumes={data_dir: {"bind": "/data", "mode": "rw"}},
-            ports=(None if DOCKER_NETWORK == "host"
-                   else {f"{port_int}/tcp": port_int, f"{port_int}/udp": port_int}),
-            network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
-            labels=old_labels,
-        )
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot recreate container: {e}")
 
-    return {
-        "ok": True,
-        "updated_fields": updated,
-        "container_id": new_c.id,
-        "name": new_c.name,
-    }
+# ── Endpoints: SuperUser ──────────────────────────────────────────────────────
 
-# --- SuperUser ---
 @app.get("/v1/servers/{cid}/superuser")
 async def get_superuser(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
@@ -664,11 +1013,11 @@ async def get_superuser(cid: str, authorization: str = Header(default=None)) -> 
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
-    pw = _extract_superuser_from_logs(c, timeout=3)
-    return {"ok": True, "superuser_password": pw}
+    return {"ok": True, "superuser_password": _read_superuser(c)}
 
 @app.post("/v1/servers/{cid}/superuser/reset")
-async def reset_superuser(cid: str, req: SuperUserResetRequest, authorization: str = Header(default=None)) -> dict[str, Any]:
+async def reset_superuser(cid: str, req: SuperUserResetRequest,
+                          authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -678,18 +1027,19 @@ async def reset_superuser(cid: str, req: SuperUserResetRequest, authorization: s
         raise HTTPException(404, detail="container not found")
     new_pw = req.password.strip() or _generate_password(16)
     try:
-        exec_res = c.exec_run(
-            ["/usr/bin/mumble-server", "-ini", INI_PATH_IN_CONTAINER, "-supw", new_pw],
+        res = c.exec_run(
+            ["/usr/bin/mumble-server", "-ini", INI_PATH, "-supw", new_pw],
             user="10000:10000",
         )
-        if exec_res.exit_code != 0:
-            output = exec_res.output.decode("utf-8", errors="replace")
-            raise HTTPException(500, detail=f"mumble-server -supw failed (exit {exec_res.exit_code}): {output}")
+        if res.exit_code != 0:
+            raise HTTPException(500, detail=f"supw failed: {res.output.decode('utf-8', errors='replace')}")
     except APIError as e:
         raise HTTPException(500, detail=f"docker exec failed: {e}")
     return {"ok": True, "superuser_password": new_pw}
 
-# --- Config (Raw-INI) via docker exec ---
+
+# ── Endpoints: Config (Raw-INI) ────────────────────────────────────────────────
+
 @app.get("/v1/servers/{cid}/config")
 async def get_config(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
@@ -699,16 +1049,11 @@ async def get_config(cid: str, authorization: str = Header(default=None)) -> dic
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
-    content = _read_config_from_container(c)
-    return {"ok": True, "content": content}
+    return {"ok": True, "content": _read_config(c)}
 
 @app.put("/v1/servers/{cid}/config")
-async def put_config(cid: str, req: ConfigUpdateRequest, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Ueberschreibt die Server-Config komplett durch Container-Recreate.
-    
-    Parst die INI-Felder aus dem Content und setzt die passenden
-    MUMBLE_CONFIG_* ENV-Variablen fuer den neuen Container.
-    """
+async def put_config(cid: str, req: ConfigUpdateRequest,
+                     authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -716,107 +1061,32 @@ async def put_config(cid: str, req: ConfigUpdateRequest, authorization: str = He
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
-
     current_port = c.labels.get("mumble-agent.port", "")
-    port_match = re.search(r"^\s*port\s*=\s*(\d+)", req.content, re.MULTILINE)
-    if port_match and port_match.group(1) != current_port:
+    port_m = re.search(r"^\s*port\s*=\s*(\d+)", req.content, re.MULTILINE)
+    if port_m and port_m.group(1) != current_port:
         raise HTTPException(400, detail=f"port cannot be changed (currently {current_port})")
-    db_match = re.search(r"^\s*database\s*=\s*(.+)$", req.content, re.MULTILINE)
-    if db_match and db_match.group(1).strip() not in ("/data/mumble-server.sqlite", ""):
-        raise HTTPException(400, detail="database path cannot be changed")
-
-    # INI-Felder -> ENV-Variablen Mapping
+    old_env  = _env_map(c)
+    new_env  = dict(old_env)
     ini_to_env = {
         "registerName": "MUMBLE_CONFIG_REGISTER_NAME",
-        "users": "MUMBLE_CONFIG_USERS",
-        "welcometext": "MUMBLE_CONFIG_WELCOMETEXT",
-        "port": "MUMBLE_CONFIG_PORT",
-        "serverpassword": "MUMBLE_CONFIG_SERVERPASSWORD",
-        "bandwidth": "MUMBLE_CONFIG_BANDWIDTH",
-        "timeout": "MUMBLE_CONFIG_TIMEOUT",
-        "opusthreshold": "MUMBLE_CONFIG_OPUSTHRESHOLD",
-        "textmessagelength": "MUMBLE_CONFIG_TEXTMESSAGELENGTH",
-        "allowhtml": "MUMBLE_CONFIG_ALLOWHTML",
+        "users":        "MUMBLE_CONFIG_USERS",
+        "welcometext":  "MUMBLE_CONFIG_WELCOMETEXT",
+        "port":         "MUMBLE_CONFIG_PORT",
+        "serverpassword":"MUMBLE_CONFIG_SERVERPASSWORD",
+        "bandwidth":    "MUMBLE_CONFIG_BANDWIDTH",
+        "timeout":      "MUMBLE_CONFIG_TIMEOUT",
     }
-
-    # Alte ENV-Variablen uebernehmen, dann mit Werten aus dem neuen INI ueberschreiben
-    old_env = {}
-    for item in (c.attrs.get("Config", {}).get("Env") or []):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            old_env[k] = v
-
-    new_env = dict(old_env)
     for line in req.content.splitlines():
         m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
-        if m:
-            ini_key = m.group(1)
-            ini_val = m.group(2).strip()
-            if ini_key in ini_to_env:
-                if ini_val:
-                    new_env[ini_to_env[ini_key]] = ini_val
-                else:
-                    new_env.pop(ini_to_env[ini_key], None)
-
-    old_labels = c.labels.copy()
-    old_name = c.name.lstrip("/")
-    data_dir = _data_dir(old_name)
-    port_int = int(current_port) if current_port.isdigit() else 64738
-
-    # Container recreate
-    try:
-        c.stop(timeout=10)
-        c.remove(force=True)
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot remove old container: {e}")
-
-    try:
-        new_c = docker_client.containers.run(
-            image=DOCKER_IMAGE, name=old_name, detach=True,
-            restart_policy={"Name": "unless-stopped"},
-            environment=new_env,
-            volumes={data_dir: {"bind": "/data", "mode": "rw"}},
-            ports=(None if DOCKER_NETWORK == "host"
-                   else {f"{port_int}/tcp": port_int, f"{port_int}/udp": port_int}),
-            network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
-            labels=old_labels,
-        )
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot recreate container: {e}")
-
+        if m and m.group(1) in ini_to_env:
+            v = m.group(2).strip()
+            if v:
+                new_env[ini_to_env[m.group(1)]] = v
+    new_c = _recreate_container(c, new_env)
     return {"ok": True, "size": len(req.content), "container_id": new_c.id}
-
-_SETTINGS_MAP = {
-    "MUMBLE_CONFIG_BANDWIDTH":          "bandwidth",
-    "MUMBLE_CONFIG_TIMEOUT":            "timeout",
-    "MUMBLE_CONFIG_TEXTMESSAGELENGTH":  "textmessagelength",
-    "MUMBLE_CONFIG_IMAGEMESSAGELENGTH": "imagemessagelength",
-    "MUMBLE_CONFIG_ALLOWHTML":          "allowhtml",
-    "MUMBLE_CONFIG_OPUSTHRESHOLD":      "opusthreshold",
-    "MUMBLE_CONFIG_DEFAULTCHANNEL":     "defaultchannel",
-    "MUMBLE_CONFIG_REMEMBERCHANNEL":    "rememberchannel",
-    "MUMBLE_CONFIG_CERTREQUIRED":       "certrequired",
-    "MUMBLE_CONFIG_USERSPERCHANNEL":    "usersperchannel",
-    "MUMBLE_CONFIG_REGISTERNAME":       "register_name",
-    "MUMBLE_CONFIG_REGISTERPASSWORD":   "register_password",
-    "MUMBLE_CONFIG_REGISTERURL":        "register_url",
-    "MUMBLE_CONFIG_REGISTERHOSTNAME":   "register_hostname",
-    "MUMBLE_CONFIG_REGISTERLOCATION":   "register_location",
-    "MUMBLE_CONFIG_AUTOBANATTEMPTS":    "autoban_attempts",
-    "MUMBLE_CONFIG_AUTOBANTIMEFRAME":   "autoban_timeframe",
-    "MUMBLE_CONFIG_AUTOBANTIME":        "autoban_time",
-    "MUMBLE_CONFIG_SENDVERSION":        "sendversion",
-    "MUMBLE_CONFIG_BONJOUR":            "bonjour",
-    "MUMBLE_CONFIG_SUGGESTVERSION":     "suggestversion",
-    "MUMBLE_CONFIG_SUGGESTPOSITIONAL":  "suggestpositional",
-    "MUMBLE_CONFIG_SUGGESTPUSHTOTALK":  "suggestpushtotalk",
-    "MUMBLE_CONFIG_SSLCERT":            "ssl_cert",
-    "MUMBLE_CONFIG_SSLKEY":             "ssl_key",
-}
 
 @app.get("/v1/servers/{cid}/settings")
 async def get_settings(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Gibt aktuelle Konfiguration aus den Container-ENV-Variablen zurück."""
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -824,21 +1094,16 @@ async def get_settings(cid: str, authorization: str = Header(default=None)) -> d
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
-    env: dict[str, str] = {}
-    for item in (c.attrs.get("Config", {}).get("Env") or []):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            env[k] = v
+    env = _env_map(c)
     settings: dict[str, Any] = {}
     for env_key, field in _SETTINGS_MAP.items():
         if env_key in env:
             settings[field] = env[env_key]
     return {"ok": True, "settings": settings}
 
-@app.put("/v1/servers/{cid}/certificate")
-async def set_certificate(cid: str, req: CertificateRequest, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Schreibt Zertifikat ins Data-Volume und konfiguriert den Container."""
-    import io, tarfile as tf
+@app.patch("/v1/servers/{cid}")
+async def update_server(cid: str, req: UpdateServerRequest,
+                        authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -846,15 +1111,112 @@ async def set_certificate(cid: str, req: CertificateRequest, authorization: str 
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
+    old_env = _env_map(c)
+    new_env = dict(old_env)
+    old_labels = c.labels.copy()
+    updated = []
 
-    # Cert-Dateien ins Data-Volume schreiben
+    def _s(env_key: str, value: Any, field: str) -> None:
+        new_env[env_key] = str(value); updated.append(field)
+    def _sb(env_key: str, value: bool | None, field: str) -> None:
+        if value is None: return
+        new_env[env_key] = "true" if value else "false"; updated.append(field)
+    def _so(env_key: str, value: Any, field: str) -> None:
+        if value: new_env[env_key] = str(value)
+        else:     new_env.pop(env_key, None)
+        updated.append(field)
+
+    if req.name is not None:
+        new_env["MUMBLE_CONFIG_REGISTER_NAME"] = req.name
+        old_labels["mumble-agent.name"]        = req.name
+        updated.append("name")
+    if req.welcome_text is not None: _so("MUMBLE_CONFIG_WELCOMETEXT",   req.welcome_text, "welcome_text")
+    if req.max_users    is not None: _s( "MUMBLE_CONFIG_USERS",         req.max_users,    "max_users")
+    if req.password     is not None: _so("MUMBLE_CONFIG_SERVERPASSWORD",req.password,     "password")
+    if req.bandwidth    is not None: _s( "MUMBLE_CONFIG_BANDWIDTH",     req.bandwidth,    "bandwidth")
+    if req.timeout      is not None: _s( "MUMBLE_CONFIG_TIMEOUT",       req.timeout,      "timeout")
+    if req.textmessagelength  is not None: _s("MUMBLE_CONFIG_TEXTMESSAGELENGTH",  req.textmessagelength,  "textmessagelength")
+    if req.imagemessagelength is not None: _s("MUMBLE_CONFIG_IMAGEMESSAGELENGTH", req.imagemessagelength, "imagemessagelength")
+    if req.allowhtml    is not None: _sb("MUMBLE_CONFIG_ALLOWHTML",     req.allowhtml,    "allowhtml")
+    if req.opusthreshold is not None: _s("MUMBLE_CONFIG_OPUSTHRESHOLD", req.opusthreshold,"opusthreshold")
+    if req.defaultchannel is not None: _s("MUMBLE_CONFIG_DEFAULTCHANNEL",req.defaultchannel,"defaultchannel")
+    if req.rememberchannel is not None: _sb("MUMBLE_CONFIG_REMEMBERCHANNEL",req.rememberchannel,"rememberchannel")
+    if req.certrequired is not None: _sb("MUMBLE_CONFIG_CERTREQUIRED",  req.certrequired, "certrequired")
+    if req.usersperchannel is not None: _s("MUMBLE_CONFIG_USERSPERCHANNEL",req.usersperchannel,"usersperchannel")
+    if req.register_name     is not None: _so("MUMBLE_CONFIG_REGISTERNAME",    req.register_name,     "register_name")
+    if req.register_password is not None: _so("MUMBLE_CONFIG_REGISTERPASSWORD",req.register_password,  "register_password")
+    if req.register_url      is not None: _so("MUMBLE_CONFIG_REGISTERURL",     req.register_url,       "register_url")
+    if req.register_hostname is not None: _so("MUMBLE_CONFIG_REGISTERHOSTNAME",req.register_hostname,  "register_hostname")
+    if req.register_location is not None: _so("MUMBLE_CONFIG_REGISTERLOCATION",req.register_location,  "register_location")
+    if req.autoban_attempts  is not None: _s("MUMBLE_CONFIG_AUTOBANATTEMPTS",  req.autoban_attempts,  "autoban_attempts")
+    if req.autoban_timeframe is not None: _s("MUMBLE_CONFIG_AUTOBANTIMEFRAME", req.autoban_timeframe, "autoban_timeframe")
+    if req.autoban_time      is not None: _s("MUMBLE_CONFIG_AUTOBANTIME",      req.autoban_time,      "autoban_time")
+    if req.sendversion       is not None: _sb("MUMBLE_CONFIG_SENDVERSION",     req.sendversion,       "sendversion")
+    if req.bonjour           is not None: _sb("MUMBLE_CONFIG_BONJOUR",         req.bonjour,           "bonjour")
+    if req.suggestversion    is not None: _so("MUMBLE_CONFIG_SUGGESTVERSION",  req.suggestversion,    "suggestversion")
+    if req.suggestpositional is not None: _sb("MUMBLE_CONFIG_SUGGESTPOSITIONAL",req.suggestpositional,"suggestpositional")
+    if req.suggestpushtotalk is not None: _sb("MUMBLE_CONFIG_SUGGESTPUSHTOTALK",req.suggestpushtotalk,"suggestpushtotalk")
+
+    if not updated:
+        return {"ok": True, "note": "nothing to update"}
+    new_c = _recreate_container(c, new_env)
+    return {"ok": True, "updated_fields": updated, "container_id": new_c.id, "name": new_c.name}
+
+
+@app.patch("/v1/servers/{cid}/live")
+async def update_settings_live(cid: str, req: LiveSettingsRequest,
+                               authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Aendert Server-Einstellungen via ICE ohne Neustart."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    comm, srv = _ice_connect(_ice_port_for(c))
+    try:
+        mapping = {
+            'name':         'registername',
+            'password':     'serverpassword',
+            'max_users':    'users',
+            'welcome_text': 'welcometext',
+        }
+        updated = []
+        for field, ice_key in mapping.items():
+            val = getattr(req, field)
+            if val is not None:
+                srv.setConf(ice_key, str(val))
+                updated.append(field)
+        if req.password is not None and req.password == '':
+            srv.setConf('serverpassword', '')
+        return {"ok": True, "updated": updated}
+    except Exception as e:
+        raise HTTPException(500, detail=f"ICE setConf fehlgeschlagen: {e}")
+    finally:
+        comm.destroy()
+
+
+# ── Endpoints: Zertifikat ─────────────────────────────────────────────────────
+
+@app.put("/v1/servers/{cid}/certificate")
+async def set_certificate(cid: str, req: CertificateRequest,
+                          authorization: str = Header(default=None)) -> dict[str, Any]:
+    import tarfile as tf
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
     for filename, content in [("mumble.crt", req.cert), ("mumble.key", req.key)]:
         data = content.encode()
         buf = io.BytesIO()
         with tf.open(fileobj=buf, mode="w") as tar:
             info = tf.TarInfo(name=filename)
             info.size = len(data)
-            info.uid = 10000; info.gid = 10000
+            info.uid = info.gid = 10000
             info.mode = 0o600
             tar.addfile(info, io.BytesIO(data))
         buf.seek(0)
@@ -862,44 +1224,16 @@ async def set_certificate(cid: str, req: CertificateRequest, authorization: str 
             c.put_archive("/data", buf)
         except APIError as e:
             raise HTTPException(500, detail=f"put_archive failed: {e}")
-
-    # Container mit SSL-ENV-Variablen neu erstellen
-    old_env: dict[str, str] = {}
-    for item in (c.attrs.get("Config", {}).get("Env") or []):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            old_env[k] = v
+    old_env = _env_map(c)
     new_env = dict(old_env)
     new_env["MUMBLE_CONFIG_SSLCERT"] = "/data/mumble.crt"
     new_env["MUMBLE_CONFIG_SSLKEY"]  = "/data/mumble.key"
-
-    old_labels = c.labels.copy()
-    old_name = c.name.lstrip("/")
-    old_port = old_labels.get("mumble-agent.port", "")
-    data_dir = _data_dir(old_name)
-    port_int = int(old_port) if old_port.isdigit() else 64738
-    try:
-        c.stop(timeout=10); c.remove(force=True)
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot remove container: {e}")
-    try:
-        new_c = docker_client.containers.run(
-            image=DOCKER_IMAGE, name=old_name, detach=True,
-            restart_policy={"Name": "unless-stopped"},
-            environment=new_env,
-            volumes={data_dir: {"bind": "/data", "mode": "rw"}},
-            ports=(None if DOCKER_NETWORK == "host"
-                   else {f"{port_int}/tcp": port_int, f"{port_int}/udp": port_int}),
-            network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
-            labels=old_labels,
-        )
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot recreate container: {e}")
+    new_c = _recreate_container(c, new_env)
     return {"ok": True, "container_id": new_c.id}
 
 @app.delete("/v1/servers/{cid}/certificate")
-async def remove_certificate(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Entfernt das benutzerdefinierte Zertifikat (zurück zu selbst-signiert)."""
+async def remove_certificate(cid: str,
+                              authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -907,53 +1241,17 @@ async def remove_certificate(cid: str, authorization: str = Header(default=None)
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
-    old_env: dict[str, str] = {}
-    for item in (c.attrs.get("Config", {}).get("Env") or []):
-        if "=" in item:
-            k, v = item.split("=", 1)
-            old_env[k] = v
+    old_env = _env_map(c)
     new_env = dict(old_env)
     new_env.pop("MUMBLE_CONFIG_SSLCERT", None)
     new_env.pop("MUMBLE_CONFIG_SSLKEY", None)
-    old_labels = c.labels.copy()
-    old_name = c.name.lstrip("/")
-    old_port = old_labels.get("mumble-agent.port", "")
-    data_dir = _data_dir(old_name)
-    port_int = int(old_port) if old_port.isdigit() else 64738
-    try:
-        c.stop(timeout=10); c.remove(force=True)
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot remove container: {e}")
-    try:
-        new_c = docker_client.containers.run(
-            image=DOCKER_IMAGE, name=old_name, detach=True,
-            restart_policy={"Name": "unless-stopped"},
-            environment=new_env,
-            volumes={data_dir: {"bind": "/data", "mode": "rw"}},
-            ports=(None if DOCKER_NETWORK == "host"
-                   else {f"{port_int}/tcp": port_int, f"{port_int}/udp": port_int}),
-            network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
-            labels=old_labels,
-        )
-    except APIError as e:
-        raise HTTPException(500, detail=f"cannot recreate container: {e}")
+    new_c = _recreate_container(c, new_env)
     return {"ok": True, "container_id": new_c.id}
 
-@app.get("/v1/servers/{cid}/viewer")
-async def channel_viewer(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Gibt Channel-Baum + Online-User zurück — ohne Mumble-Client-Connect."""
-    check_token(authorization)
-    assert docker_client is not None
-    try:
-        c = docker_client.containers.get(cid)
-        _require_managed(c)
-    except NotFound:
-        raise HTTPException(404, detail="container not found")
-    result = get_mumble_viewer(c)
-    if not result["ok"]:
-        raise HTTPException(503, detail=result.get("error", "viewer unavailable"))
-    return result
+
+# ── Error-Handler ─────────────────────────────────────────────────────────────
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"ok": False, "error": exc.detail})
+    return JSONResponse(status_code=exc.status_code,
+                        content={"ok": False, "error": exc.detail})

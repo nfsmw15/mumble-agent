@@ -2,6 +2,48 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.0.0] — 2026-05-16
+
+### Neu — ZeroC ICE Integration
+
+Vollständige Umstellung von Log-/SQLite-Parsing auf die native **ZeroC ICE**-Schnittstelle von Mumble. Der Agent kommuniziert jetzt direkt mit dem laufenden Mumble-Prozess — alle Änderungen werden sofort aktiv ohne Neustart.
+
+### Hinzugefügt
+- **ICE-Initialisierung** beim Agent-Start (`_init_ice()`) — lädt `MumbleServer.ice` einmalig
+- **ICE-Port-Erkennung** pro Container (`_ice_port_for()`) — liest Port aus `/data/mumble_server_config.ini` via `docker exec grep`, Fallback auf 6502
+- **ICE-Verbindung** (`_ice_connect(ice_port)`) — gibt `(comm, server_proxy)` zurück, Caller muss `comm.destroy()` aufrufen
+- `GET /v1/servers/{cid}/viewer` — **komplett neu via ICE**: `srv.getTree()` liefert exakte Channel-Struktur und User-Positionen mit Mute/Deaf-Status in Echtzeit (kein Log-Parsing mehr)
+- `GET /v1/servers/{cid}/users` — alle verbundenen User via ICE `getUsers()`
+- `POST /v1/servers/{cid}/users/{session}/kick` — User kicken via ICE `kickUser()`
+- `PATCH /v1/servers/{cid}/users/{session}` — User-Status ändern (mute/deaf) via ICE `setState()`
+- `GET /v1/servers/{cid}/channels` — flache Channel-Map via ICE `getChannels()`
+- `POST /v1/servers/{cid}/channels` — Channel erstellen via ICE `addChannel()`
+- `PATCH /v1/servers/{cid}/channels/{channel_id}` — Channel umbenennen/Position via ICE `setChannelState()`
+- `DELETE /v1/servers/{cid}/channels/{channel_id}` — Channel löschen via ICE `removeChannel()`
+- `GET /v1/servers/{cid}/acl?channel_id=N` — ACL eines Channels lesen via ICE `getACL()`
+- `PUT /v1/servers/{cid}/acl` — ACL setzen via ICE `setACL()` (inkl. Gruppen, inherit_acl)
+- `GET /v1/servers/{cid}/bans` — aktive Bans lesen via ICE `getBans()`
+- `PUT /v1/servers/{cid}/bans` — Bans komplett setzen via ICE `setBans()`
+- `PATCH /v1/servers/{cid}/live` — Einstellungen live ändern via ICE `setConf()` ohne Neustart (Name, Passwort, Max-Nutzer, Begrüßungstext)
+- Konverter-Hilfsfunktionen: `_tree_to_dict`, `_user_to_dict`, `_channel_to_dict`, `_acl_to_dict`, `_group_to_dict`, `_ban_to_dict`, `_ice_acl_entry`, `_ice_group`, `_addr_to_bytes`
+- Pydantic-Modelle: `LiveSettingsRequest`, `AclEntryModel`, `AclGroupModel`, `SetAclRequest`, `AddChannelRequest`, `UpdateChannelRequest`, `KickRequest`, `UpdateUserRequest`, `BanEntry`, `SetBansRequest`
+
+### Geändert
+- `AGENT_VERSION` → `2.0.0`
+- `/viewer`-Endpoint: nutzt jetzt ICE `getTree()` statt SQLite + Log-Parsing — exakte Daten in Echtzeit, kein Cache mehr nötig
+- `/stats`-Endpoint: User-Zählung via ICE statt Log-Parsing
+
+### Entfernt
+- SQLite-basiertes Channel-Parsing (`docker exec sqlite3`)
+- Log-basiertes User-Tracking (Connect/Disconnect/Move-Events parsen)
+
+### Voraussetzungen (neu)
+- `zeroc-ice` Python-Paket (`pip install zeroc-ice`)
+- Mumble-Container mit aktivem ICE-Endpoint (`MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502`)
+- Bei mehreren Containern im `--network host` Modus: **jeder Container braucht einen eigenen ICE-Port**
+
+---
+
 ## [v1.4.0] — 2026-05-15
 
 ### Hinzugefügt
