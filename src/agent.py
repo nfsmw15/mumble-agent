@@ -434,16 +434,24 @@ def _tree_to_dict(tree) -> dict:
 
 def _user_to_dict(u) -> dict:
     return {
-        "session":   u.session,
-        "name":      u.name,
-        "userid":    u.userid,
-        "channel":   u.channel,
-        "mute":      u.mute,
-        "deaf":      u.deaf,
-        "self_mute": u.selfMute,
-        "self_deaf": u.selfDeaf,
-        "recording": u.recording,
-        "idle":      u.idlesecs,
+        "session":      u.session,
+        "name":         u.name,
+        "userid":       u.userid,
+        "channel":      u.channel,
+        "mute":         u.mute,
+        "deaf":         u.deaf,
+        "self_mute":    u.selfMute,
+        "self_deaf":    u.selfDeaf,
+        "recording":    u.recording,
+        "idle":         u.idlesecs,
+        "bytespersec":  u.bytespersec,
+        "udp_ping":     round(u.udpPing, 1),
+        "tcp_ping":     round(u.tcpPing, 1),
+        "tcp_only":     u.tcponly,
+        "online_secs":  u.onlinesecs,
+        "os":           u.os,
+        "os_version":   u.osversion,
+        "version":      str(u.version) if u.version else '',
     }
 
 def _channel_to_dict(ch) -> dict:
@@ -689,6 +697,85 @@ async def server_stats(cid: str, authorization: str = Header(default=None)) -> d
 
     return {"ok": True, "online": online, "uptime": uptime,
             "status": c.status, "started_at": started_at}
+
+@app.get("/v1/servers/{cid}/dashboard")
+async def server_dashboard(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Dashboard-Daten: ICE-Stats + Docker-Ressourcen in einem Aufruf."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+
+    # ── Uptime ────────────────────────────────────────────────────────────────
+    started_at = c.attrs.get("State", {}).get("StartedAt", "")
+    uptime_secs = 0
+    if started_at and c.status == "running":
+        try:
+            ts = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            uptime_secs = max(0, int((datetime.now(timezone.utc) - ts).total_seconds()))
+        except Exception:
+            pass
+
+    # ── ICE-Daten ─────────────────────────────────────────────────────────────
+    users_list: list[dict] = []
+    channel_count = 0
+    ban_count = 0
+    if c.status == "running" and _MumbleServer:
+        try:
+            comm, srv = _ice_connect(_ice_port_for(c))
+            try:
+                ice_users = srv.getUsers()
+                users_list = [_user_to_dict(u) for u in ice_users.values()]
+                channel_count = len(srv.getChannels())
+                ban_count = len(srv.getBans())
+            finally:
+                comm.destroy()
+        except Exception:
+            pass  # ICE nicht erreichbar – leere Werte zurückgeben
+
+    # ── Docker-Ressourcen ─────────────────────────────────────────────────────
+    cpu_pct = 0.0
+    mem_mb  = 0.0
+    net_rx_mb = 0.0
+    net_tx_mb = 0.0
+    if c.status == "running":
+        try:
+            stats = c.stats(stream=False)
+            # CPU
+            cpu_delta = (stats['cpu_stats']['cpu_usage']['total_usage']
+                         - stats['precpu_stats']['cpu_usage']['total_usage'])
+            sys_delta  = (stats['cpu_stats']['system_cpu_usage']
+                          - stats['precpu_stats'].get('system_cpu_usage', 0))
+            num_cpu    = stats['cpu_stats'].get('online_cpus', 1)
+            cpu_pct    = round((cpu_delta / sys_delta) * num_cpu * 100, 1) if sys_delta > 0 else 0.0
+            # RAM
+            mem_mb = round(stats['memory_stats'].get('usage', 0) / 1048576, 1)
+            # Netzwerk (alle Interfaces summieren)
+            net_rx = sum(v.get('rx_bytes', 0) for v in stats.get('networks', {}).values())
+            net_tx = sum(v.get('tx_bytes', 0) for v in stats.get('networks', {}).values())
+            net_rx_mb = round(net_rx / 1048576, 2)
+            net_tx_mb = round(net_tx / 1048576, 2)
+        except Exception:
+            pass  # Docker-Stats nicht verfügbar – Nullwerte behalten
+
+    return {
+        "ok": True,
+        "data": {
+            "status":        c.status,
+            "uptime_secs":   uptime_secs,
+            "users":         users_list,
+            "user_count":    len(users_list),
+            "channel_count": channel_count,
+            "ban_count":     ban_count,
+            "cpu_percent":   cpu_pct,
+            "mem_mb":        mem_mb,
+            "net_rx_mb":     net_rx_mb,
+            "net_tx_mb":     net_tx_mb,
+        },
+    }
 
 @app.get("/v1/servers/{cid}/viewer")
 async def channel_viewer(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
