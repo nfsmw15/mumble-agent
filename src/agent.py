@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.8.0"
+AGENT_VERSION = "2.9.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -118,9 +118,8 @@ app = FastAPI(title="mumble-agent", version=AGENT_VERSION, lifespan=lifespan)
 
 
 def _ice_port_for(c) -> int:
-    """ICE-Port aus Container-Config lesen; Fallback = 6502 (Mumble-Standard)."""
+    """ICE-Port aus Container-Config lesen; Fallback aus Mumble-Port berechnet."""
     try:
-        # Lese die ice=... Zeile aus der INI — unterstützt ice=tcp... und ice="tcp..."
         res = c.exec_run(
             ["sh", "-c",
              "grep '^ice=' /data/mumble_server_config.ini | grep -oP '(?<=-p )\\d+'"],
@@ -132,7 +131,12 @@ def _ice_port_for(c) -> int:
                 return port
     except Exception:
         pass
-    return 6502
+    # Fallback: aus Mumble-Port berechnen (Label mumble-agent.port)
+    try:
+        mumble_port = int(c.labels.get("mumble-agent.port", "64738"))
+        return _ice_port_for_port(mumble_port)
+    except Exception:
+        return 6502
 
 
 def _ice_connect(ice_port: int):
@@ -301,13 +305,19 @@ def _require_managed(c) -> None:
 def _generate_password(length: int = 16) -> str:
     return "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(length))
 
+def _ice_port_for_port(mumble_port: int) -> int:
+    """Eindeutiger ICE-Port pro Mumble-Port: offset 6502 ab Basis-Port 64738."""
+    return 6502 + (mumble_port - 64738)
+
 def _config_for(req: CreateServerRequest) -> dict[str, str]:
     port = req.port
+    ice_port = _ice_port_for_port(port)
     cfg = {
         "MUMBLE_CONFIG_REGISTER_NAME": req.name,
         "MUMBLE_CONFIG_USERS":         str(req.max_users),
         "MUMBLE_CONFIG_WELCOMETEXT":   req.welcome_text or "Willkommen!",
         "MUMBLE_CONFIG_PORT":          str(port),
+        "MUMBLE_CONFIG_ICE":           f'"tcp -h 127.0.0.1 -p {ice_port}"',
     }
     if req.password:
         cfg["MUMBLE_CONFIG_SERVERPASSWORD"] = req.password
@@ -668,7 +678,13 @@ async def create_server(req: CreateServerRequest,
         )
     except APIError as e:
         raise HTTPException(500, detail=f"docker error: {e.explanation or str(e)}")
-    superuser_pw = _extract_superuser(c, timeout=30)
+    # Mumble 1.5 loggt das Passwort; 1.6 nicht mehr → kurz warten, dann selbst setzen
+    superuser_pw = _extract_superuser(c, timeout=5)
+    if not superuser_pw:
+        superuser_pw = ''.join(secrets.choice(string.ascii_letters + string.digits)
+                               for _ in range(16))
+        time.sleep(2)  # warten bis Server vollständig gestartet
+        c.exec_run(["mumble-server", "--ini", INI_PATH, "--supw", superuser_pw], demux=False)
     return {"ok": True, "container_id": c.id, "name": c.name,
             "superuser_password": superuser_pw}
 

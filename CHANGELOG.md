@@ -2,6 +2,14 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.9.0] — 2026-05-17
+
+### Behoben
+- **ICE-Port-Konflikt**: Jeder Container bekommt einen eindeutigen ICE-Port (`6502 + (mumble_port - 64738)`) statt alle fest auf 6502 — behebt "Address already in use" bei mehreren Servern pro Host
+- **Mumble 1.6 SuperUser-Passwort**: `_extract_superuser` Timeout von 30s auf 5s reduziert; wenn kein Passwort in den Logs gefunden wird (Mumble 1.6 loggt es nicht mehr), wird ein zufälliges Passwort generiert und per `mumble-server --supw` gesetzt — behebt "creating"-Status nach PHP-Timeout
+
+---
+
 ## [v2.8.0] — 2026-05-17
 
 ### Behoben
