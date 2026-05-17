@@ -89,6 +89,14 @@ MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502
 - TLS-Reverse-Proxy (nginx, Caddy, Traefik)
 - `zeroc-ice` Python-Paket (wird via `pip install zeroc-ice` installiert; benötigt `libssl-dev`, `libbz2-dev`)
 
+Manuell vorab installieren (alles weitere übernimmt `setup.sh`):
+
+```bash
+apt-get install -y git sudo
+```
+
+> `sudo` muss auch dann installiert sein, wenn du bereits als root arbeitest — `setup.sh` nutzt `sudo -u mumble-agent` intern zum Wechsel auf den Service-User.
+
 ## Verzeichnisstruktur
 
 ```
@@ -106,14 +114,18 @@ mumble-agent/
 ## Installation
 
 ```bash
+# Voraussetzungen vorab installieren
+apt-get install -y git sudo
+
+# Repo klonen und Setup starten (als root)
 git clone https://github.com/nfsmw15/mumble-agent.git
 cd mumble-agent
-sudo bash setup.sh
+bash setup.sh
 ```
 
 Das Script:
 
-1. installiert Pakete (`python3-venv`, `docker.io`, `iproute2`, `sqlite3`)
+1. installiert Pakete (`python3-venv`, `python3-pip`, `docker.io`, `ca-certificates`, `iproute2`, `openssl`, `sqlite3`)
 2. legt Service-User `mumble-agent` an (Gruppe `docker`)
 3. richtet venv unter `/opt/mumble-agent/venv` ein
 4. generiert einen zufälligen 64-Zeichen-Token in `/etc/mumble-agent/agent.env`
