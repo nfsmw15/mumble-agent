@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import string
+import shutil
 import sys
 import time
 from contextlib import asynccontextmanager, redirect_stderr
@@ -598,10 +599,14 @@ async def delete_server(cid: str, authorization: str = Header(default=None)) -> 
         return {"ok": True, "note": "container already gone"}
     except APIError as e:
         raise HTTPException(500, detail=str(e))
+    name = c.name.lstrip("/")
     try:
         c.remove(force=True)
     except APIError as e:
         raise HTTPException(500, detail=str(e))
+    data_dir = _data_dir(name)
+    if os.path.isdir(data_dir):
+        shutil.rmtree(data_dir, ignore_errors=True)
     return {"ok": True}
 
 @app.post("/v1/servers/{cid}/start")
