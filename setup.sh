@@ -9,6 +9,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 INSTALL_DIR=/opt/mumble-agent
 DATA_DIR=/var/lib/mumble-agent
 CONFIG_DIR=/etc/mumble-agent
