@@ -139,23 +139,47 @@ sudo systemctl status mumble-agent
 
 ## Netzwerk-Zugang
 
-### Internes Netz ohne Reverse-Proxy (empfohlen für Proxmox/LAN)
+### Szenario 1: Internes Netz ohne Reverse-Proxy (Proxmox/LAN)
 
-Standard nach Setup: `MUMBLE_AGENT_HOST=0.0.0.0` — der Agent ist direkt per interner IP erreichbar. Im Webinterface dann `http://192.168.x.x:8000` als Agent-URL eintragen. Der Bearer-Token schützt den Zugang.
+Standard nach Setup: `MUMBLE_AGENT_HOST=0.0.0.0` — der Agent ist direkt per interner IP erreichbar. Im Webinterface `http://192.168.x.x:8000` als Agent-URL eintragen. Der Bearer-Token schützt den Zugang.
 
-### Mit TLS-Reverse-Proxy (für öffentliche Server)
+```
+[Easy2-Webserver] ──HTTP──► [mumble-host:8000]
+```
 
-`MUMBLE_AGENT_HOST=127.0.0.1` in `agent.env` setzen, dann einen Reverse-Proxy davor schalten:
+### Szenario 2: Reverse-Proxy auf demselben Host
 
-### Caddy
+Proxy läuft auf dem Mumble-Host selbst. Agent auf `127.0.0.1` beschränken:
+
+```
+[Easy2-Webserver] ──HTTPS──► [mumble-host:443/8443 → 127.0.0.1:8000]
+```
+
+In `agent.env`: `MUMBLE_AGENT_HOST=127.0.0.1`
+
+### Szenario 3: Zentraler Proxy-LXC/-VM davor (z.B. Traefik, nginx)
+
+Proxy läuft in einem eigenen LXC oder einer eigenen VM und leitet an die interne IP des Mumble-Hosts weiter. Agent bleibt auf `0.0.0.0` oder wird auf die interne IP gebunden:
+
+```
+[Easy2-Webserver] ──HTTPS──► [Proxy-LXC:443 → mumble-host:8000]
+```
+
+Das ist das empfohlene Setup wenn bereits ein zentraler Reverse-Proxy für mehrere Dienste existiert.
+
+---
+
+### Proxy-Konfigurationen
+
+#### Caddy (auf Mumble-Host oder Proxy-LXC)
 
 ```caddyfile
 mumble1.example.com:8443 {
-    reverse_proxy 127.0.0.1:8000
+    reverse_proxy 127.0.0.1:8000  # oder interne IP bei Proxy-LXC
 }
 ```
 
-### nginx
+#### nginx (auf Mumble-Host oder Proxy-LXC)
 
 ```nginx
 server {
@@ -165,7 +189,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/mumble1.example.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8000;
+        proxy_pass http://127.0.0.1:8000;  # oder interne IP bei Proxy-LXC
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_read_timeout 30s;
@@ -173,11 +197,36 @@ server {
 }
 ```
 
+#### Traefik (Docker-Label oder statische Konfiguration)
+
+```yaml
+# traefik/config/mumble-agent.yml
+http:
+  routers:
+    mumble-agent:
+      rule: "Host(`mumble1.example.com`) && PathPrefix(`/`)"
+      entryPoints:
+        - websecure
+      service: mumble-agent
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    mumble-agent:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.x.x:8000"  # interne IP des Mumble-Hosts
+```
+
 ## Test
 
 ```bash
+# Ohne Proxy (internes Netz)
 TOKEN=$(grep MUMBLE_AGENT_TOKEN /etc/mumble-agent/agent.env | cut -d= -f2)
-curl -k https://mumble1.example.com:8443/v1/ping -H "Authorization: Bearer $TOKEN"
+curl http://192.168.x.x:8000/v1/ping -H "Authorization: Bearer $TOKEN"
+
+# Mit Reverse-Proxy
+curl https://mumble1.example.com:8443/v1/ping -H "Authorization: Bearer $TOKEN"
 ```
 
 ## Konfiguration
