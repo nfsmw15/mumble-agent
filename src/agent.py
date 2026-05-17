@@ -191,9 +191,6 @@ class CertificateRequest(BaseModel):
 class SuperUserResetRequest(BaseModel):
     password: str = Field(default="", max_length=128)
 
-class ConfigUpdateRequest(BaseModel):
-    content: str = Field(min_length=10, max_length=64000)
-
 class AclEntryModel(BaseModel):
     user_id: int | None = Field(default=None)
     group: str | None   = Field(default=None, max_length=64)
@@ -326,23 +323,6 @@ def _read_superuser(c) -> str | None:
             continue
     return None
 
-def _patch_ini(ini_text: str, updates: dict[str, str]) -> str:
-    lines = ini_text.splitlines()
-    seen: set[str] = set()
-    out: list[str] = []
-    for line in lines:
-        m = re.match(r"^\s*#?\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
-        if m and m.group(1) in updates:
-            key = m.group(1)
-            out.append(f"{key}={updates[key]}")
-            seen.add(key)
-        else:
-            out.append(line)
-    for k, v in updates.items():
-        if k not in seen:
-            out.append(f"{k}={v}")
-    return "\n".join(out) + "\n"
-
 def _read_config(c) -> str:
     res = c.exec_run(["cat", INI_PATH], demux=False)
     if res.exit_code != 0:
@@ -405,30 +385,58 @@ def _env_map(c) -> dict[str, str]:
             env[k] = v
     return env
 
-def _recreate_container(c, new_env: dict[str, str]) -> docker.models.containers.Container:
-    old_labels = c.labels.copy()
-    old_name   = c.name.lstrip("/")
-    old_port   = old_labels.get("mumble-agent.port", "")
-    data_dir   = _data_dir(old_name)
-    port_int   = int(old_port) if old_port.isdigit() else 64738
-    try:
-        c.stop(timeout=10)
-        c.remove(force=True)
-    except APIError as e:
-        raise HTTPException(500, detail=f"container remove failed: {e}")
-    try:
+def _recreate_container(c, new_env: dict[str, str],
+                        new_labels: dict | None = None) -> docker.models.containers.Container:
+    old_labels  = c.labels.copy()
+    old_name    = c.name.lstrip("/")
+    old_port    = old_labels.get("mumble-agent.port", "")
+    data_dir    = _data_dir(old_name)
+    port_int    = int(old_port) if old_port.isdigit() else 64738
+    use_labels  = new_labels if new_labels is not None else old_labels
+    backup_name = old_name + "_backup"
+
+    def _run(name: str, env: dict, labels: dict):
         return docker_client.containers.run(
-            image=DOCKER_IMAGE, name=old_name, detach=True,
+            image=DOCKER_IMAGE, name=name, detach=True,
             restart_policy={"Name": "unless-stopped"},
-            environment=new_env,
+            environment=env,
             volumes={data_dir: {"bind": "/data", "mode": "rw"}},
             ports=(None if DOCKER_NETWORK == "host"
                    else {f"{port_int}/tcp": port_int, f"{port_int}/udp": port_int}),
             network_mode=DOCKER_NETWORK if DOCKER_NETWORK == "host" else None,
-            labels=old_labels,
+            labels=labels,
         )
+
+    # Rename old container so new one can take the canonical name
+    try:
+        c.rename(backup_name)
     except APIError as e:
-        raise HTTPException(500, detail=f"container create failed: {e}")
+        raise HTTPException(500, detail=f"rename failed: {e}")
+
+    try:
+        c.stop(timeout=10)
+    except APIError as e:
+        try: c.rename(old_name)
+        except Exception: pass
+        raise HTTPException(500, detail=f"stop failed: {e}")
+
+    try:
+        new_c = _run(old_name, new_env, use_labels)
+    except APIError as e:
+        # Rollback: restart old container under its original name
+        try:
+            c.rename(old_name)
+            c.start()
+        except Exception:
+            pass  # best-effort; data intact, manual recovery possible
+        raise HTTPException(500, detail=f"container create failed, old container restored: {e}")
+
+    # Success — drop backup
+    try:
+        c.remove(force=True)
+    except APIError:
+        pass  # non-critical, can be cleaned up manually
+    return new_c
 
 
 # ── ICE-Daten-Konverter ───────────────────────────────────────────────────────
@@ -1137,53 +1145,6 @@ async def reset_superuser(cid: str, req: SuperUserResetRequest,
         raise HTTPException(500, detail=f"docker exec failed: {e}")
     return {"ok": True, "superuser_password": new_pw}
 
-
-# ── Endpoints: Config (Raw-INI) ────────────────────────────────────────────────
-
-@app.get("/v1/servers/{cid}/config")
-async def get_config(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    check_token(authorization)
-    assert docker_client is not None
-    try:
-        c = docker_client.containers.get(cid)
-        _require_managed(c)
-    except NotFound:
-        raise HTTPException(404, detail="container not found")
-    return {"ok": True, "content": _read_config(c)}
-
-@app.put("/v1/servers/{cid}/config")
-async def put_config(cid: str, req: ConfigUpdateRequest,
-                     authorization: str = Header(default=None)) -> dict[str, Any]:
-    check_token(authorization)
-    assert docker_client is not None
-    try:
-        c = docker_client.containers.get(cid)
-        _require_managed(c)
-    except NotFound:
-        raise HTTPException(404, detail="container not found")
-    current_port = c.labels.get("mumble-agent.port", "")
-    port_m = re.search(r"^\s*port\s*=\s*(\d+)", req.content, re.MULTILINE)
-    if port_m and port_m.group(1) != current_port:
-        raise HTTPException(400, detail=f"port cannot be changed (currently {current_port})")
-    old_env  = _env_map(c)
-    new_env  = dict(old_env)
-    ini_to_env = {
-        "registerName": "MUMBLE_CONFIG_REGISTER_NAME",
-        "users":        "MUMBLE_CONFIG_USERS",
-        "welcometext":  "MUMBLE_CONFIG_WELCOMETEXT",
-        "port":         "MUMBLE_CONFIG_PORT",
-        "serverpassword":"MUMBLE_CONFIG_SERVERPASSWORD",
-        "bandwidth":    "MUMBLE_CONFIG_BANDWIDTH",
-        "timeout":      "MUMBLE_CONFIG_TIMEOUT",
-    }
-    for line in req.content.splitlines():
-        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", line)
-        if m and m.group(1) in ini_to_env:
-            v = m.group(2).strip()
-            if v:
-                new_env[ini_to_env[m.group(1)]] = v
-    new_c = _recreate_container(c, new_env)
-    return {"ok": True, "size": len(req.content), "container_id": new_c.id}
 
 @app.get("/v1/servers/{cid}/settings")
 async def get_settings(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
