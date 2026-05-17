@@ -13,7 +13,9 @@ v1.2.2: Config/SuperUser via docker exec.
 
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import os
 import re
 import secrets
@@ -21,6 +23,7 @@ import string
 import shutil
 import sys
 import time
+import urllib.request
 from contextlib import asynccontextmanager, redirect_stderr
 from datetime import datetime, timezone
 from typing import Any
@@ -31,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.0.0"
+AGENT_VERSION = "2.4.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.5.735")
@@ -44,6 +47,35 @@ if not AGENT_TOKEN:
     raise RuntimeError("MUMBLE_AGENT_TOKEN nicht gesetzt.")
 
 docker_client: docker.DockerClient | None = None
+
+# ── Update-Check ──────────────────────────────────────────────────────────────
+_UPDATE_INTERVAL = 24 * 3600  # einmal täglich
+_update_cache: dict[str, Any] = {"latest": None, "checked_at": 0}
+
+def _fetch_latest_image() -> str | None:
+    """Fragt Docker Hub nach dem neuesten versionierten Tag von mumblevoip/mumble-server."""
+    url = ("https://hub.docker.com/v2/repositories/mumblevoip/mumble-server"
+           "/tags?page_size=50&ordering=last_updated")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        tag_re = re.compile(r'^v\d+\.\d+\.\d+$')
+        for entry in data.get("results", []):
+            tag = entry.get("name", "")
+            if tag_re.match(tag):
+                return f"mumblevoip/mumble-server:{tag}"
+    except Exception as e:
+        print(f"[mumble-agent] Update-Check fehlgeschlagen: {e}", flush=True)
+    return None
+
+async def _update_check_loop() -> None:
+    while True:
+        latest = await asyncio.get_event_loop().run_in_executor(None, _fetch_latest_image)
+        if latest:
+            _update_cache["latest"]     = latest
+            _update_cache["checked_at"] = int(time.time())
+            print(f"[mumble-agent] Neuestes Image: {latest}", flush=True)
+        await asyncio.sleep(_UPDATE_INTERVAL)
 
 # ── ICE-Setup ────────────────────────────────────────────────────────────────
 _MumbleServer = None   # nach _init_ice() gesetzt
@@ -76,7 +108,9 @@ async def lifespan(_: FastAPI):
     _init_ice()
     docker_client = docker.from_env()
     os.makedirs(DATA_ROOT, mode=0o750, exist_ok=True)
+    task = asyncio.create_task(_update_check_loop())
     yield
+    task.cancel()
     if docker_client is not None:
         docker_client.close()
 
@@ -566,12 +600,15 @@ def _addr_to_bytes(addr: str) -> list[int]:
 @app.get("/v1/ping")
 async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
+    latest = _update_cache["latest"]
     return {
         "ok": True, "agent": "mumble-agent", "version": AGENT_VERSION,
         "ice": _MumbleServer is not None,
         "time": int(time.time()),
         "docker_version": docker_client.version().get("Version") if docker_client else None,
-        "mumble_image": DOCKER_IMAGE,
+        "mumble_image":   DOCKER_IMAGE,
+        "latest_image":   latest,
+        "update_available": latest is not None and latest != DOCKER_IMAGE,
     }
 
 @app.post("/v1/servers")

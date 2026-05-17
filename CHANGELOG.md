@@ -2,6 +2,15 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.4.0] — 2026-05-17
+
+### Hinzugefügt
+- **Automatischer Update-Check**: Agent prüft beim Start und danach einmal täglich Docker Hub nach dem neuesten `mumblevoip/mumble-server`-Tag
+- `/v1/ping` gibt jetzt `latest_image` (neuester verfügbarer Tag) und `update_available` (bool) zurück
+- Webinterface zeigt in der Host-Übersicht ein gelbes Badge mit der neuen Version wenn ein Update verfügbar ist
+
+---
+
 ## [v2.3.0] — 2026-05-17
 
 ### Hinzugefügt
