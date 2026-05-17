@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.7.0"
+AGENT_VERSION = "2.8.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -732,10 +732,26 @@ async def upgrade_server(cid: str, authorization: str = Header(default=None)) ->
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
+    # Image nur ziehen wenn nicht schon vorhanden
     try:
-        docker_client.images.pull(DOCKER_IMAGE)
-    except APIError as e:
-        raise HTTPException(500, detail=f"image pull fehlgeschlagen: {e}")
+        docker_client.images.get(DOCKER_IMAGE)
+    except docker.errors.ImageNotFound:
+        try:
+            docker_client.images.pull(DOCKER_IMAGE)
+        except APIError as e:
+            raise HTTPException(500, detail=f"image pull fehlgeschlagen: {e}")
+    # SQLite-DB auf NULL-Werte prüfen — Mumble 1.6 Migration bricht sonst ab
+    data_dir = _data_dir(c.name.lstrip("/"))
+    db_path = os.path.join(data_dir, "mumble-server.sqlite")
+    if os.path.isfile(db_path):
+        try:
+            import sqlite3 as _sq
+            con = _sq.connect(db_path)
+            con.execute("UPDATE channel_info SET value = '' WHERE value IS NULL")
+            con.commit()
+            con.close()
+        except Exception as e:
+            print(f"[mumble-agent] DB-Vorbereinigung fehlgeschlagen (nicht kritisch): {e}", flush=True)
     old_env = _env_map(c)
     new_c = _recreate_container(c, old_env)
     return {"ok": True, "container_id": new_c.id, "image": DOCKER_IMAGE}

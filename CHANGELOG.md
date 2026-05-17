@@ -2,6 +2,14 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.8.0] — 2026-05-17
+
+### Behoben
+- `POST /upgrade`: SQLite-DB wird vor dem Recreate auf NULL-Werte in `channel_info` geprüft und bereinigt — behebt Mumble 1.5→1.6 Migrationsfehler (`NOT NULL constraint failed: channel_properties.property_value`)
+- Image-Pull wird übersprungen wenn das Image bereits lokal vorhanden ist
+
+---
+
 ## [v2.7.0] — 2026-05-17
 
 ### Geändert
