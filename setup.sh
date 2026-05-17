@@ -52,7 +52,7 @@ if [[ ! -f "$CONFIG_DIR/agent.env" ]]; then
     cat > "$CONFIG_DIR/agent.env" <<EOF
 # mumble-agent configuration
 MUMBLE_AGENT_TOKEN=$TOKEN
-MUMBLE_AGENT_IMAGE=mumblevoip/mumble-server:latest
+MUMBLE_AGENT_IMAGE=mumblevoip/mumble-server:v1.5.735
 MUMBLE_AGENT_NETWORK=host
 MUMBLE_AGENT_DATA=/var/lib/mumble-agent
 EOF

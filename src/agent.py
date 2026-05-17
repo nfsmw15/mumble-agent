@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 AGENT_VERSION = "2.0.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
-DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:latest")
+DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.5.735")
 DOCKER_NETWORK = os.environ.get("MUMBLE_AGENT_NETWORK", "host")
 DATA_ROOT      = os.environ.get("MUMBLE_AGENT_DATA", "/var/lib/mumble-agent")
 LABEL_KEY      = "mumble-agent.managed"
