@@ -99,7 +99,12 @@ else
     echo "  Token: $TOKEN"
 fi
 
-echo "[7/8] MumbleServer.ice herunterladen..."
+echo "[7/8] Mumble-Server Docker-Image vorziehen..."
+MUMBLE_IMAGE=$(grep "^MUMBLE_AGENT_IMAGE" "$CONFIG_DIR/agent.env" | cut -d= -f2)
+MUMBLE_IMAGE="${MUMBLE_IMAGE:-mumblevoip/mumble-server:v1.5.735}"
+docker pull "$MUMBLE_IMAGE" || echo "  WARNUNG: Image-Pull fehlgeschlagen — wird beim ersten Server-Start nachgeholt."
+
+echo "[7b/8] MumbleServer.ice herunterladen..."
 ICE_FILE="$INSTALL_DIR/MumbleServer.ice"
 if [[ ! -f "$ICE_FILE" ]]; then
     ICE_URL="https://raw.githubusercontent.com/mumble-voip/mumble/master/src/murmur/MumbleServer.ice"

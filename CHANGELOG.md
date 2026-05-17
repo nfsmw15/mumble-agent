@@ -2,6 +2,14 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.3.0] — 2026-05-17
+
+### Hinzugefügt
+- Setup-Schritt `[7/8]`: Docker-Image wird jetzt bereits beim `setup.sh` gezogen — verhindert HTTP-Timeout beim ersten Server-Anlegen
+- `/v1/ping` gibt `mumble_image` zurück — das Webinterface zeigt das aktive Image in der Host-Übersicht an
+
+---
+
 ## [v2.2.0] — 2026-05-17
 
 ### Behoben

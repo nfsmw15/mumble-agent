@@ -571,6 +571,7 @@ async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
         "ice": _MumbleServer is not None,
         "time": int(time.time()),
         "docker_version": docker_client.version().get("Version") if docker_client else None,
+        "mumble_image": DOCKER_IMAGE,
     }
 
 @app.post("/v1/servers")
