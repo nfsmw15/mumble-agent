@@ -118,20 +118,19 @@ app = FastAPI(title="mumble-agent", version=AGENT_VERSION, lifespan=lifespan)
 
 
 def _ice_port_for(c) -> int:
-    """ICE-Port aus Container-Config lesen; Fallback aus Mumble-Port berechnet."""
+    """ICE-Port aus Container-Env-Var lesen (schnell, kein exec_run nötig)."""
+    # Primär: MUMBLE_CONFIG_ICE env var (seit v2.9.0 explizit gesetzt)
     try:
-        res = c.exec_run(
-            ["sh", "-c",
-             "grep '^ice=' /data/mumble_server_config.ini | grep -oP '(?<=-p )\\d+'"],
-            demux=False,
-        )
-        if res.exit_code == 0 and res.output:
-            port = int(res.output.decode().strip())
+        env = _env_map(c)
+        ice_val = env.get("MUMBLE_CONFIG_ICE", "")
+        m = re.search(r'-p\s+(\d+)', ice_val)
+        if m:
+            port = int(m.group(1))
             if 1 <= port <= 65535:
                 return port
     except Exception:
         pass
-    # Fallback: aus Mumble-Port berechnen (Label mumble-agent.port)
+    # Fallback: aus Mumble-Port berechnen
     try:
         mumble_port = int(c.labels.get("mumble-agent.port", "64738"))
         return _ice_port_for_port(mumble_port)
@@ -150,7 +149,7 @@ def _ice_connect(ice_port: int):
     import Ice
     comm = Ice.initialize()
     try:
-        base = comm.stringToProxy(f"Meta:tcp -h 127.0.0.1 -p {ice_port} -t 5000")
+        base = comm.stringToProxy(f"Meta:tcp -h 127.0.0.1 -p {ice_port} -t 1500")
         meta = _MumbleServer.MetaPrx.checkedCast(base)
         if not meta:
             comm.destroy()
@@ -889,19 +888,9 @@ async def server_stats(cid: str, authorization: str = Header(default=None)) -> d
             "status": c.status, "started_at": started_at,
             "image": c.attrs.get("Config", {}).get("Image", "")}
 
-@app.get("/v1/servers/{cid}/dashboard")
-async def server_dashboard(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Dashboard-Daten: ICE-Stats + Docker-Ressourcen in einem Aufruf."""
-    check_token(authorization)
-    assert docker_client is not None
-    try:
-        c = docker_client.containers.get(cid)
-        _require_managed(c)
-    except NotFound:
-        raise HTTPException(404, detail="container not found")
-
-    # ── Uptime ────────────────────────────────────────────────────────────────
-    started_at = c.attrs.get("State", {}).get("StartedAt", "")
+def _dashboard_sync(c) -> dict:
+    """Alle blockierenden Calls für einen Container — wird im Thread-Pool ausgeführt."""
+    started_at  = c.attrs.get("State", {}).get("StartedAt", "")
     uptime_secs = 0
     if started_at and c.status == "running":
         try:
@@ -910,7 +899,6 @@ async def server_dashboard(cid: str, authorization: str = Header(default=None)) 
         except Exception:
             pass
 
-    # ── ICE-Daten ─────────────────────────────────────────────────────────────
     users_list: list[dict] = []
     channel_count = 0
     ban_count = 0
@@ -925,48 +913,34 @@ async def server_dashboard(cid: str, authorization: str = Header(default=None)) 
             finally:
                 comm.destroy()
         except Exception:
-            pass  # ICE nicht erreichbar – leere Werte zurückgeben
-
-    # ── Docker-Ressourcen ─────────────────────────────────────────────────────
-    cpu_pct = 0.0
-    mem_mb  = 0.0
-    net_rx_mb = 0.0
-    net_tx_mb = 0.0
-    if c.status == "running":
-        try:
-            stats = c.stats(stream=False)
-            # CPU
-            cpu_delta = (stats['cpu_stats']['cpu_usage']['total_usage']
-                         - stats['precpu_stats']['cpu_usage']['total_usage'])
-            sys_delta  = (stats['cpu_stats']['system_cpu_usage']
-                          - stats['precpu_stats'].get('system_cpu_usage', 0))
-            num_cpu    = stats['cpu_stats'].get('online_cpus', 1)
-            cpu_pct    = round((cpu_delta / sys_delta) * num_cpu * 100, 1) if sys_delta > 0 else 0.0
-            # RAM
-            mem_mb = round(stats['memory_stats'].get('usage', 0) / 1048576, 1)
-            # Netzwerk (alle Interfaces summieren)
-            net_rx = sum(v.get('rx_bytes', 0) for v in stats.get('networks', {}).values())
-            net_tx = sum(v.get('tx_bytes', 0) for v in stats.get('networks', {}).values())
-            net_rx_mb = round(net_rx / 1048576, 2)
-            net_tx_mb = round(net_tx / 1048576, 2)
-        except Exception:
-            pass  # Docker-Stats nicht verfügbar – Nullwerte behalten
+            pass
 
     return {
-        "ok": True,
-        "data": {
-            "status":        c.status,
-            "uptime_secs":   uptime_secs,
-            "users":         users_list,
-            "user_count":    len(users_list),
-            "channel_count": channel_count,
-            "ban_count":     ban_count,
-            "cpu_percent":   cpu_pct,
-            "mem_mb":        mem_mb,
-            "net_rx_mb":     net_rx_mb,
-            "net_tx_mb":     net_tx_mb,
-        },
+        "status":        c.status,
+        "uptime_secs":   uptime_secs,
+        "users":         users_list,
+        "user_count":    len(users_list),
+        "channel_count": channel_count,
+        "ban_count":     ban_count,
+        "cpu_percent":   0.0,
+        "mem_mb":        0.0,
+        "net_rx_mb":     0.0,
+        "net_tx_mb":     0.0,
     }
+
+@app.get("/v1/servers/{cid}/dashboard")
+async def server_dashboard(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Dashboard-Daten: ICE-Stats + Docker-Ressourcen in einem Aufruf."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, _dashboard_sync, c)
+    return {"ok": True, "data": data}
 
 @app.get("/v1/servers/{cid}/viewer")
 async def channel_viewer(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:

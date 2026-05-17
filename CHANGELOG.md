@@ -2,6 +2,16 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.10.1] — 2026-05-18
+
+### Performance
+- `/v1/servers/{cid}/dashboard`: `container.stats()` entfernt — war Hauptbottleneck (2s/Container, serialisiert im Docker-Daemon). CPU/RAM-Werte werden im Dashboard-Überblick nicht live benötigt (Cron liefert historische Daten)
+- `_dashboard_sync()` läuft via `run_in_executor` im Thread-Pool — mehrere Container pro Host werden jetzt parallel abgefragt
+- `_ice_port_for()` liest ICE-Port direkt aus Container-Env-Var statt via `exec_run` (grep im Container)
+- ICE-Verbindungs-Timeout 5000ms → 1500ms
+
+---
+
 ## [v2.10.0] — 2026-05-18
 
 ### Behoben
