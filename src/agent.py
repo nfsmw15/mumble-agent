@@ -317,7 +317,7 @@ def _config_for(req: CreateServerRequest) -> dict[str, str]:
         "MUMBLE_CONFIG_USERS":         str(req.max_users),
         "MUMBLE_CONFIG_WELCOMETEXT":   req.welcome_text or "Willkommen!",
         "MUMBLE_CONFIG_PORT":          str(port),
-        "MUMBLE_CONFIG_ICE":           f'"tcp -h 127.0.0.1 -p {ice_port}"',
+        "MUMBLE_CONFIG_ICE":           f'tcp -h 127.0.0.1 -p {ice_port}',
     }
     if req.password:
         cfg["MUMBLE_CONFIG_SERVERPASSWORD"] = req.password
