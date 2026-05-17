@@ -2,6 +2,23 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.2.0] — 2026-05-17
+
+### Behoben
+- `setup.sh` Szenario 3 (Proxy-LXC) setzte fälschlich `127.0.0.1` — korrigiert auf `0.0.0.0`
+- `setup.sh` Upgrade-Falle: fehlende `MUMBLE_AGENT_HOST`/`MUMBLE_AGENT_PORT` werden bei bestehender `agent.env` automatisch nachgetragen
+- Schrittezähler in `setup.sh` war inkonsistent (`[1/7]`…`[7/8]`) — durchgehend `[x/8]`
+- `zeroc-ice` fehlte in `requirements.txt` — ICE-Funktionen wurden installiert aber nicht als Abhängigkeit deklariert
+- `libssl-dev`, `libbz2-dev` fehlten in `setup.sh` — `zeroc-ice` konnte ohne passendes Wheel nicht gebaut werden
+- `MumbleServer.ice` wurde nicht installiert — `setup.sh` lädt sie jetzt von GitHub, mit Fallback-Warnung bei Verbindungsfehler
+
+### Dokumentation
+- README: „HTTPS-Requests" → „HTTP/HTTPS-Requests" (internes HTTP offiziell erlaubt)
+- README Sicherheit: ehrlicher Hinweis dass `docker`-Gruppe praktisch host-root-fähig ist
+- README Firewall-Tabelle: Port 8000 für Szenarien 1 und 3 ergänzt, Szenario-Spalte hinzugefügt
+
+---
+
 ## [v2.1.0] — 2026-05-17
 
 ### Hinzugefügt

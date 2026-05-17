@@ -6,7 +6,7 @@ Gehört zu [Easy2-Mumble](https://github.com/nfsmw15/easy2-mumble) — der Webse
 
 ## Was macht der Agent?
 
-Auf jedem Mumble-Host läuft eine Instanz des `mumble-agent`. Er nimmt HTTPS-Requests vom Easy2-Webserver entgegen (Bearer-Token authentifiziert) und steuert lokal die Docker-Container der einzelnen Mumble-Server.
+Auf jedem Mumble-Host läuft eine Instanz des `mumble-agent`. Er nimmt HTTP/HTTPS-Requests vom Easy2-Webserver entgegen (Bearer-Token authentifiziert) und steuert lokal die Docker-Container der einzelnen Mumble-Server.
 
 ```
 ┌───────────────────┐  HTTPS+Token  ┌─────────────────────────┐
@@ -76,7 +76,7 @@ MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502
 - Bearer-Token, im Setup zufällig generiert (32 Byte, hex)
 - Constant-time Vergleich (`secrets.compare_digest`)
 - Container-Label-Guard: nur Container mit `mumble-agent.managed=1` werden angefasst
-- Service läuft als unprivilegierter User `mumble-agent` (in der Gruppe `docker`)
+- Service läuft als unprivilegierter User `mumble-agent`, **benötigt aber Docker-Socket-Zugriff** (Gruppe `docker`) — effektiv host-root-fähig für Container-Operationen
 - systemd-Hardening (`ProtectSystem=strict`, `NoNewPrivileges` etc.)
 - Listen-Adresse über `MUMBLE_AGENT_HOST` konfigurierbar (`0.0.0.0` = direkt per interner IP, `127.0.0.1` = nur mit Reverse-Proxy)
 
@@ -246,10 +246,11 @@ Nach Änderung: `systemctl restart mumble-agent`.
 
 ## Firewall
 
-| Port | Protokoll | Richtung | Zweck |
-|------|-----------|----------|-------|
-| 8443 | TCP | Inbound (vom Webserver) | Agent-API |
-| 64738–64838 | TCP+UDP | Inbound (Internet) | Mumble-Clients |
+| Port | Protokoll | Richtung | Zweck | Szenario |
+|------|-----------|----------|-------|----------|
+| 8000 | TCP | Webserver/Proxy → Agent-VM | Agent-API direkt | 1 (LAN), 3 (Proxy-LXC) |
+| 8443 | TCP | Webserver → Proxy | Agent-API via Reverse-Proxy | 2, 3 |
+| 64738–64838 | TCP+UDP | Internet → Mumble-Host | Mumble-Clients | alle |
 
 ## Logs
 

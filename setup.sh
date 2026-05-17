@@ -17,22 +17,23 @@ CONFIG_DIR=/etc/mumble-agent
 USER=mumble-agent
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "[1/7] System-Pakete installieren..."
+echo "[1/8] System-Pakete installieren..."
 apt-get update -qq
-apt-get install -y -qq python3-venv python3-pip docker.io ca-certificates iproute2 openssl sqlite3
+apt-get install -y -qq python3-venv python3-pip docker.io ca-certificates iproute2 openssl sqlite3 \
+    libssl-dev libbz2-dev curl
 
-echo "[2/7] Service-User anlegen..."
+echo "[2/8] Service-User anlegen..."
 if ! id "$USER" >/dev/null 2>&1; then
     useradd --system --home "$INSTALL_DIR" --shell /usr/sbin/nologin "$USER"
 fi
 usermod -aG docker "$USER"
 
-echo "[3/7] Verzeichnisse anlegen..."
+echo "[3/8] Verzeichnisse anlegen..."
 install -d -m 0750 -o "$USER" -g "$USER" "$INSTALL_DIR"
 install -d -m 0750 -o "$USER" -g "$USER" "$DATA_DIR"
 install -d -m 0750 -o root    -g "$USER" "$CONFIG_DIR"
 
-echo "[4/7] Code kopieren..."
+echo "[4/8] Code kopieren..."
 cp "$SCRIPT_DIR/src/agent.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/src/requirements.txt" "$INSTALL_DIR/"
 chown -R "$USER:$USER" "$INSTALL_DIR"
@@ -43,12 +44,12 @@ install -d -m 0750 -o root -g "$USER" "$CONFIG_DIR/ssl"
 echo "[4c] mumble-cert-deploy installieren..."
 install -m 0755 "$SCRIPT_DIR/src/mumble-cert-deploy" /usr/local/bin/mumble-cert-deploy
 
-echo "[5/7] Python venv aufsetzen..."
+echo "[5/8] Python venv aufsetzen..."
 sudo -u "$USER" python3 -m venv "$INSTALL_DIR/venv"
 sudo -u "$USER" "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 sudo -u "$USER" "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 
-echo "[6/7] Konfiguration anlegen..."
+echo "[6/8] Konfiguration anlegen..."
 
 # Netzwerk-Setup abfragen
 INTERNAL_IP=$(hostname -I | awk '{print $1}')
@@ -65,8 +66,8 @@ read -rp "  Auswahl [1/2/3, Standard: 1]: " NET_CHOICE
 NET_CHOICE="${NET_CHOICE:-1}"
 
 case "$NET_CHOICE" in
-    2|3) AGENT_HOST="127.0.0.1" ;;
-    *)   AGENT_HOST="0.0.0.0" ;;
+    2) AGENT_HOST="127.0.0.1" ;;  # Proxy auf diesem Host → nur lokal
+    *) AGENT_HOST="0.0.0.0"   ;;  # LAN direkt oder Proxy-LXC → alle Interfaces
 esac
 
 if [[ ! -f "$CONFIG_DIR/agent.env" ]]; then
@@ -88,12 +89,33 @@ EOF
     echo "  >>> $TOKEN"
     echo
 else
-    echo "  $CONFIG_DIR/agent.env existiert bereits, übersprungen."
+    echo "  $CONFIG_DIR/agent.env existiert bereits — fehlende Variablen werden ergänzt."
     TOKEN=$(grep MUMBLE_AGENT_TOKEN "$CONFIG_DIR/agent.env" | cut -d= -f2)
+    # Upgrade-Sicherheit: neue Pflicht-Variablen nachtragen falls fehlend
+    grep -q "^MUMBLE_AGENT_HOST" "$CONFIG_DIR/agent.env" || \
+        echo "MUMBLE_AGENT_HOST=$AGENT_HOST" >> "$CONFIG_DIR/agent.env"
+    grep -q "^MUMBLE_AGENT_PORT" "$CONFIG_DIR/agent.env" || \
+        echo "MUMBLE_AGENT_PORT=8000"        >> "$CONFIG_DIR/agent.env"
     echo "  Token: $TOKEN"
 fi
 
-echo "[7/8] systemd-Unit installieren..."
+echo "[7/8] MumbleServer.ice herunterladen..."
+ICE_FILE="$INSTALL_DIR/MumbleServer.ice"
+if [[ ! -f "$ICE_FILE" ]]; then
+    ICE_URL="https://raw.githubusercontent.com/mumble-voip/mumble/master/src/murmur/MumbleServer.ice"
+    if curl -fsSL "$ICE_URL" -o "$ICE_FILE" 2>/dev/null; then
+        chown "$USER:$USER" "$ICE_FILE"
+        echo "  MumbleServer.ice heruntergeladen."
+    else
+        echo "  WARNUNG: Download fehlgeschlagen. ICE-Funktionen (Viewer/ACL/Channels/Bans)"
+        echo "  werden nicht verfügbar sein bis MumbleServer.ice manuell nach"
+        echo "  $ICE_FILE kopiert wird."
+    fi
+else
+    echo "  MumbleServer.ice bereits vorhanden, übersprungen."
+fi
+
+echo "[8/8] systemd-Unit installieren..."
 cp "$SCRIPT_DIR/systemd/mumble-agent.service" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable mumble-agent.service
