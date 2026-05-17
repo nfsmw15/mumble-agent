@@ -78,7 +78,7 @@ MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502
 - Container-Label-Guard: nur Container mit `mumble-agent.managed=1` werden angefasst
 - Service läuft als unprivilegierter User `mumble-agent` (in der Gruppe `docker`)
 - systemd-Hardening (`ProtectSystem=strict`, `NoNewPrivileges` etc.)
-- Lauscht nur auf `127.0.0.1:8000` — TLS-Termination erfolgt extern
+- Listen-Adresse über `MUMBLE_AGENT_HOST` konfigurierbar (`0.0.0.0` = direkt per interner IP, `127.0.0.1` = nur mit Reverse-Proxy)
 
 ## Voraussetzungen
 
@@ -86,8 +86,8 @@ MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502
 - Python 3.10+
 - Docker
 - systemd
-- TLS-Reverse-Proxy (nginx, Caddy, Traefik)
 - `zeroc-ice` Python-Paket (wird via `pip install zeroc-ice` installiert; benötigt `libssl-dev`, `libbz2-dev`)
+- Reverse-Proxy optional — für interne Netze reicht `MUMBLE_AGENT_HOST=0.0.0.0`
 
 Manuell vorab installieren (alles weitere übernimmt `setup.sh`):
 
@@ -137,9 +137,15 @@ sudo systemctl start mumble-agent
 sudo systemctl status mumble-agent
 ```
 
-## Reverse-Proxy
+## Netzwerk-Zugang
 
-Der Agent lauscht auf `127.0.0.1:8000`. Davor muss ein TLS-Reverse-Proxy stehen.
+### Internes Netz ohne Reverse-Proxy (empfohlen für Proxmox/LAN)
+
+Standard nach Setup: `MUMBLE_AGENT_HOST=0.0.0.0` — der Agent ist direkt per interner IP erreichbar. Im Webinterface dann `http://192.168.x.x:8000` als Agent-URL eintragen. Der Bearer-Token schützt den Zugang.
+
+### Mit TLS-Reverse-Proxy (für öffentliche Server)
+
+`MUMBLE_AGENT_HOST=127.0.0.1` in `agent.env` setzen, dann einen Reverse-Proxy davor schalten:
 
 ### Caddy
 
@@ -181,7 +187,9 @@ Alle Einstellungen in `/etc/mumble-agent/agent.env`:
 | Variable | Default | Beschreibung |
 |----------|---------|--------------|
 | `MUMBLE_AGENT_TOKEN` | (generiert) | Bearer-Token für Auth |
-| `MUMBLE_AGENT_IMAGE` | `mumblevoip/mumble-server:latest` | Docker-Image |
+| `MUMBLE_AGENT_HOST` | `0.0.0.0` | Listen-Adresse (`0.0.0.0` = alle Interfaces, `127.0.0.1` = nur lokal) |
+| `MUMBLE_AGENT_PORT` | `8000` | Listen-Port |
+| `MUMBLE_AGENT_IMAGE` | `mumblevoip/mumble-server:v1.5.735` | Docker-Image (gepinnte Version) |
 | `MUMBLE_AGENT_NETWORK` | `host` | Docker-Netzwerk-Mode (`host` oder Bridge) |
 | `MUMBLE_AGENT_DATA` | `/var/lib/mumble-agent` | Daten-Volume Root |
 

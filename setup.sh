@@ -57,6 +57,10 @@ MUMBLE_AGENT_TOKEN=$TOKEN
 MUMBLE_AGENT_IMAGE=mumblevoip/mumble-server:v1.5.735
 MUMBLE_AGENT_NETWORK=host
 MUMBLE_AGENT_DATA=/var/lib/mumble-agent
+# Netzwerk: 0.0.0.0 = direkt per interner IP erreichbar (kein Reverse-Proxy nötig)
+#           127.0.0.1 = nur lokal, Reverse-Proxy davor erforderlich
+MUMBLE_AGENT_HOST=0.0.0.0
+MUMBLE_AGENT_PORT=8000
 EOF
     chmod 0640 "$CONFIG_DIR/agent.env"
     chown root:"$USER" "$CONFIG_DIR/agent.env"

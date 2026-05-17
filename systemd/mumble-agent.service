@@ -12,8 +12,8 @@ Group=docker
 EnvironmentFile=/etc/mumble-agent/agent.env
 WorkingDirectory=/opt/mumble-agent
 ExecStart=/opt/mumble-agent/venv/bin/uvicorn agent:app \
-  --host 127.0.0.1 \
-  --port 8000 \
+  --host ${MUMBLE_AGENT_HOST} \
+  --port ${MUMBLE_AGENT_PORT} \
   --no-access-log \
   --log-level info
 Restart=on-failure
