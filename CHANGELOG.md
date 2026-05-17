@@ -2,6 +2,33 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.1.0] — 2026-05-17
+
+### Hinzugefügt
+- **Setup-Wizard**: `setup.sh` fragt beim ersten Ausführen welcher Netzwerk-Modus gewünscht ist (LAN direkt / Proxy auf diesem Host / Zentraler Proxy-LXC) und setzt `MUMBLE_AGENT_HOST` entsprechend
+- Abschlussmeldung zeigt je nach Wahl die korrekte Agent-URL mit erkannter interner IP
+- Token wird auch bei bestehender `agent.env` am Ende angezeigt
+
+### Geändert
+- `MUMBLE_AGENT_HOST` und `MUMBLE_AGENT_PORT` jetzt über `agent.env` konfigurierbar — kein manuelles systemd-Override mehr nötig
+- Standard: `MUMBLE_AGENT_HOST=0.0.0.0` (direkt per interner IP erreichbar, kein Reverse-Proxy erforderlich)
+- `DOCKER_IMAGE` auf `v1.5.735` gepinnt statt `latest`
+
+### Behoben
+- `setup.sh`: `PATH` explizit gesetzt — `useradd`/`usermod` wurden auf Debian 13 nicht gefunden
+- `channelnestinglimit`, `allowping`, `username`, `channelname` im PATCH-Handler ergänzt — wurden bisher still ignoriert
+- `_recreate_container()`: Rollback-Strategie — alter Container wird umbenannt statt sofort gelöscht; bei Fehler wird er neugestartet
+- `GET/PUT /v1/servers/{cid}/config` (Raw-INI) entfernt — war nicht erreichbar und mappte nur 7 von ~30 INI-Keys
+- `_patch_ini()` und `ConfigUpdateRequest` entfernt (toter Code)
+
+### Dokumentation
+- Netzwerk-Abschnitt mit allen 3 Szenarien (LAN, lokaler Proxy, Proxy-LXC) und ASCII-Diagrammen
+- Traefik-Konfigurationsbeispiel ergänzt
+- Konfigurationstabelle um `MUMBLE_AGENT_HOST` und `MUMBLE_AGENT_PORT` erweitert
+- Voraussetzungen: `git` und `sudo` als Pflichtpakete vor `setup.sh` dokumentiert
+
+---
+
 ## [v2.0.0] — 2026-05-16
 
 ### Neu — ZeroC ICE Integration
