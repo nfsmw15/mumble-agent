@@ -2,6 +2,14 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.10.0] — 2026-05-18
+
+### Behoben
+- **Mumble 1.6 SuperUser-Passwort**: In Mumble 1.6 heißt der Flag `--set-su-pw` statt `--supw`, und `exec_run` blockiert wegen SQLite-Lock wenn der Server läuft — Lösung: One-Shot-Container (`docker run --rm`) mit überschriebenem Entrypoint setzt das Passwort ohne Konflikt
+- `resetSuperUserPassword` nutzt dieselbe Methode und funktioniert damit auch für Mumble 1.6
+
+---
+
 ## [v2.9.0] — 2026-05-17
 
 ### Behoben

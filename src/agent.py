@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.9.0"
+AGENT_VERSION = "2.10.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -324,6 +324,50 @@ def _config_for(req: CreateServerRequest) -> dict[str, str]:
     return cfg
 
 _SUPERUSER_PW_RE = re.compile(r"Password for 'SuperUser' set to '([^']+)'")
+
+def _set_superuser_password(c, pw: str) -> bool:
+    """Setzt das SuperUser-Passwort via One-Shot-Container (kein DB-Lock).
+    Hauptcontainer wird gestoppt, temporärer Container setzt PW, Hauptcontainer startet neu."""
+    data_dir = _data_dir(c.name.lstrip("/"))
+    image    = c.attrs.get("Config", {}).get("Image", DOCKER_IMAGE)
+    try:
+        c.stop(timeout=3)
+    except Exception as e:
+        print(f"[mumble-agent] SuperUser-PW: stop fehlgeschlagen: {e}", flush=True)
+        return False
+    try:
+        # Mumble 1.6+: Entrypoint überschreiben damit --foreground nicht angehängt wird
+        docker_client.containers.run(
+            image=image,
+            entrypoint="mumble-server",
+            command=["--ini", INI_PATH, "--set-su-pw", pw],
+            volumes={data_dir: {"bind": "/data", "mode": "rw"}},
+            network_mode="none",
+            user="10000:10000",
+            remove=True,
+        )
+        ok = True
+    except Exception:
+        try:
+            # Mumble 1.5 Fallback
+            docker_client.containers.run(
+                image=image,
+                entrypoint="/usr/bin/mumble-server",
+                command=["-ini", INI_PATH, "-supw", pw],
+                volumes={data_dir: {"bind": "/data", "mode": "rw"}},
+                network_mode="none",
+                user="10000:10000",
+                remove=True,
+            )
+            ok = True
+        except Exception as e:
+            print(f"[mumble-agent] SuperUser-PW setzen fehlgeschlagen: {e}", flush=True)
+            ok = False
+    try:
+        c.start()
+    except Exception as e:
+        print(f"[mumble-agent] SuperUser-PW: restart fehlgeschlagen: {e}", flush=True)
+    return ok
 
 def _search_superuser(text: str) -> str | None:
     m = _SUPERUSER_PW_RE.search(text)
@@ -679,12 +723,12 @@ async def create_server(req: CreateServerRequest,
     except APIError as e:
         raise HTTPException(500, detail=f"docker error: {e.explanation or str(e)}")
     # Mumble 1.5 loggt das Passwort; 1.6 nicht mehr → kurz warten, dann selbst setzen
-    superuser_pw = _extract_superuser(c, timeout=5)
+    # Mumble 1.5 loggt das Passwort; 1.6 nicht mehr → kurz warten, dann selbst setzen
+    superuser_pw = _extract_superuser(c, timeout=1)
     if not superuser_pw:
         superuser_pw = ''.join(secrets.choice(string.ascii_letters + string.digits)
                                for _ in range(16))
-        time.sleep(2)  # warten bis Server vollständig gestartet
-        c.exec_run(["mumble-server", "--ini", INI_PATH, "--supw", superuser_pw], demux=False)
+        _set_superuser_password(c, superuser_pw)
     return {"ok": True, "container_id": c.id, "name": c.name,
             "superuser_password": superuser_pw}
 
@@ -1261,12 +1305,8 @@ async def reset_superuser(cid: str, req: SuperUserResetRequest,
         raise HTTPException(404, detail="container not found")
     new_pw = req.password.strip() or _generate_password(16)
     try:
-        res = c.exec_run(
-            ["/usr/bin/mumble-server", "-ini", INI_PATH, "-supw", new_pw],
-            user="10000:10000",
-        )
-        if res.exit_code != 0:
-            raise HTTPException(500, detail=f"supw failed: {res.output.decode('utf-8', errors='replace')}")
+        if not _set_superuser_password(c, new_pw):
+            raise HTTPException(500, detail="SuperUser-Passwort konnte nicht gesetzt werden")
     except APIError as e:
         raise HTTPException(500, detail=f"docker exec failed: {e}")
     return {"ok": True, "superuser_password": new_pw}
