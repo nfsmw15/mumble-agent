@@ -34,10 +34,10 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.4.0"
+AGENT_VERSION = "2.5.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
-DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.5.735")
+DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
 DOCKER_NETWORK = os.environ.get("MUMBLE_AGENT_NETWORK", "host")
 DATA_ROOT      = os.environ.get("MUMBLE_AGENT_DATA", "/var/lib/mumble-agent")
 LABEL_KEY      = "mumble-agent.managed"
@@ -690,6 +690,24 @@ async def stop_server(cid: str, authorization: str = Header(default=None)) -> di
     except APIError as e:
         raise HTTPException(500, detail=str(e))
     return {"ok": True}
+
+@app.post("/v1/servers/{cid}/upgrade")
+async def upgrade_server(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Container mit aktuellem DOCKER_IMAGE neu erstellen (Image-Upgrade)."""
+    check_token(authorization)
+    assert docker_client is not None
+    try:
+        c = docker_client.containers.get(cid)
+        _require_managed(c)
+    except NotFound:
+        raise HTTPException(404, detail="container not found")
+    try:
+        docker_client.images.pull(DOCKER_IMAGE)
+    except APIError as e:
+        raise HTTPException(500, detail=f"image pull fehlgeschlagen: {e}")
+    old_env = _env_map(c)
+    new_c = _recreate_container(c, old_env)
+    return {"ok": True, "container_id": new_c.id, "image": DOCKER_IMAGE}
 
 @app.post("/v1/servers/{cid}/restart")
 async def restart_server(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:

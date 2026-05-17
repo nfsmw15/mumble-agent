@@ -75,7 +75,7 @@ if [[ ! -f "$CONFIG_DIR/agent.env" ]]; then
     cat > "$CONFIG_DIR/agent.env" <<EOF
 # mumble-agent configuration
 MUMBLE_AGENT_TOKEN=$TOKEN
-MUMBLE_AGENT_IMAGE=mumblevoip/mumble-server:v1.5.735
+MUMBLE_AGENT_IMAGE=mumblevoip/mumble-server:v1.6.870
 MUMBLE_AGENT_NETWORK=host
 MUMBLE_AGENT_DATA=/var/lib/mumble-agent
 # Netzwerk: 0.0.0.0 = alle Interfaces, 127.0.0.1 = nur lokal (mit Reverse-Proxy)
@@ -101,7 +101,7 @@ fi
 
 echo "[7/8] Mumble-Server Docker-Image vorziehen..."
 MUMBLE_IMAGE=$(grep "^MUMBLE_AGENT_IMAGE" "$CONFIG_DIR/agent.env" | cut -d= -f2)
-MUMBLE_IMAGE="${MUMBLE_IMAGE:-mumblevoip/mumble-server:v1.5.735}"
+MUMBLE_IMAGE="${MUMBLE_IMAGE:-mumblevoip/mumble-server:v1.6.870}"
 docker pull "$MUMBLE_IMAGE" || echo "  WARNUNG: Image-Pull fehlgeschlagen — wird beim ersten Server-Start nachgeholt."
 
 echo "[7b/8] MumbleServer.ice herunterladen..."

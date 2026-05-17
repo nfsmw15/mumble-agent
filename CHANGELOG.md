@@ -2,6 +2,16 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.5.0] — 2026-05-17
+
+### Hinzugefügt
+- `POST /v1/servers/{cid}/upgrade` — Container mit aktuellem `DOCKER_IMAGE` neu erstellen (Image-Upgrade mit Rollback)
+
+### Geändert
+- Standard-Image auf `mumblevoip/mumble-server:v1.6.870` (Mumble 1.6) aktualisiert
+
+---
+
 ## [v2.4.0] — 2026-05-17
 
 ### Hinzugefügt
