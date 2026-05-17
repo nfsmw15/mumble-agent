@@ -2,6 +2,13 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.7.0] — 2026-05-17
+
+### Geändert
+- `/v1/servers/{cid}/stats` gibt `image` (laufendes Container-Image) zurück
+
+---
+
 ## [v2.6.0] — 2026-05-17
 
 ### Hinzugefügt

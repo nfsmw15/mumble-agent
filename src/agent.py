@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.6.0"
+AGENT_VERSION = "2.7.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -804,7 +804,8 @@ async def server_stats(cid: str, authorization: str = Header(default=None)) -> d
             pass
 
     return {"ok": True, "online": online, "uptime": uptime,
-            "status": c.status, "started_at": started_at}
+            "status": c.status, "started_at": started_at,
+            "image": c.attrs.get("Config", {}).get("Image", "")}
 
 @app.get("/v1/servers/{cid}/dashboard")
 async def server_dashboard(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
