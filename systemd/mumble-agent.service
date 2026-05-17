@@ -16,7 +16,7 @@ ExecStart=/opt/mumble-agent/venv/bin/uvicorn agent:app \
   --port ${MUMBLE_AGENT_PORT} \
   --no-access-log \
   --log-level info
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 # Hardening
@@ -24,7 +24,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/mumble-agent
+ReadWritePaths=/var/lib/mumble-agent /etc/mumble-agent
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

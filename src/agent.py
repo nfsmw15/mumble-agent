@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.5.0"
+AGENT_VERSION = "2.6.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -273,6 +273,9 @@ class BanEntry(BaseModel):
 
 class SetBansRequest(BaseModel):
     bans: list[BanEntry] = Field(default_factory=list)
+
+class UpdateImageRequest(BaseModel):
+    image: str = Field(..., min_length=1, max_length=256)
 
 
 # ── Docker-Helpers ────────────────────────────────────────────────────────────
@@ -610,6 +613,34 @@ async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
         "latest_image":   latest,
         "update_available": latest is not None and latest != DOCKER_IMAGE,
     }
+
+@app.post("/v1/image")
+async def update_image(req: UpdateImageRequest,
+                       authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Aktualisiert MUMBLE_AGENT_IMAGE in agent.env und startet den Agent neu."""
+    check_token(authorization)
+    if not re.match(r'^[a-zA-Z0-9][\w./:@-]{0,254}$', req.image):
+        raise HTTPException(400, detail="ungültiger Image-Name")
+    env_file = "/etc/mumble-agent/agent.env"
+    try:
+        with open(env_file, encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines, found = [], False
+        for line in lines:
+            if line.startswith("MUMBLE_AGENT_IMAGE="):
+                new_lines.append(f"MUMBLE_AGENT_IMAGE={req.image}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"MUMBLE_AGENT_IMAGE={req.image}\n")
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except OSError as e:
+        raise HTTPException(500, detail=f"agent.env schreiben fehlgeschlagen: {e}")
+    print(f"[mumble-agent] Image aktualisiert auf {req.image} — starte neu…", flush=True)
+    asyncio.get_event_loop().call_later(1.0, lambda: sys.exit(0))
+    return {"ok": True, "image": req.image, "restarting": True}
 
 @app.post("/v1/servers")
 async def create_server(req: CreateServerRequest,

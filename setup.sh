@@ -82,7 +82,7 @@ MUMBLE_AGENT_DATA=/var/lib/mumble-agent
 MUMBLE_AGENT_HOST=$AGENT_HOST
 MUMBLE_AGENT_PORT=8000
 EOF
-    chmod 0640 "$CONFIG_DIR/agent.env"
+    chmod 0660 "$CONFIG_DIR/agent.env"
     chown root:"$USER" "$CONFIG_DIR/agent.env"
     echo
     echo "  >>> Generierter Agent-Token (für Easy2-Mumble Host-Eintrag):"

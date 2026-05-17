@@ -2,6 +2,17 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.6.0] — 2026-05-17
+
+### Hinzugefügt
+- `POST /v1/image` — schreibt neues `MUMBLE_AGENT_IMAGE` in `agent.env` und startet den Agent neu (Restart=always in systemd)
+
+### Geändert
+- systemd-Unit: `Restart=on-failure` → `Restart=always`, `/etc/mumble-agent` zu `ReadWritePaths` ergänzt
+- `setup.sh`: `agent.env` auf 0660 — Agent-User darf Datei schreiben
+
+---
+
 ## [v2.5.0] — 2026-05-17
 
 ### Hinzugefügt
