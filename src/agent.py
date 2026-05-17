@@ -171,8 +171,12 @@ class UpdateServerRequest(BaseModel):
     sendversion: bool | None     = Field(default=None)
     bonjour: bool | None         = Field(default=None)
     suggestversion: str | None   = Field(default=None, max_length=32)
-    suggestpositional: bool | None = Field(default=None)
-    suggestpushtotalk: bool | None = Field(default=None)
+    suggestpositional: bool | None    = Field(default=None)
+    suggestpushtotalk: bool | None    = Field(default=None)
+    channelnestinglimit: int | None   = Field(default=None, ge=0, le=50)
+    allowping: bool | None            = Field(default=None)
+    username: str | None              = Field(default=None, max_length=512)
+    channelname: str | None           = Field(default=None, max_length=512)
 
 class LiveSettingsRequest(BaseModel):
     name: str | None         = Field(default=None, max_length=64)
@@ -383,10 +387,14 @@ _SETTINGS_MAP = {
     "MUMBLE_CONFIG_SENDVERSION":       "sendversion",
     "MUMBLE_CONFIG_BONJOUR":           "bonjour",
     "MUMBLE_CONFIG_SUGGESTVERSION":    "suggestversion",
-    "MUMBLE_CONFIG_SUGGESTPOSITIONAL": "suggestpositional",
-    "MUMBLE_CONFIG_SUGGESTPUSHTOTALK": "suggestpushtotalk",
-    "MUMBLE_CONFIG_SSLCERT":           "ssl_cert",
-    "MUMBLE_CONFIG_SSLKEY":            "ssl_key",
+    "MUMBLE_CONFIG_SUGGESTPOSITIONAL":   "suggestpositional",
+    "MUMBLE_CONFIG_SUGGESTPUSHTOTALK":   "suggestpushtotalk",
+    "MUMBLE_CONFIG_CHANNELNESTINGLIMIT": "channelnestinglimit",
+    "MUMBLE_CONFIG_ALLOWPING":           "allowping",
+    "MUMBLE_CONFIG_USERNAME":            "username",
+    "MUMBLE_CONFIG_CHANNELNAME":         "channelname",
+    "MUMBLE_CONFIG_SSLCERT":             "ssl_cert",
+    "MUMBLE_CONFIG_SSLKEY":              "ssl_key",
 }
 
 def _env_map(c) -> dict[str, str]:
@@ -1246,8 +1254,12 @@ async def update_server(cid: str, req: UpdateServerRequest,
     if req.sendversion       is not None: _sb("MUMBLE_CONFIG_SENDVERSION",     req.sendversion,       "sendversion")
     if req.bonjour           is not None: _sb("MUMBLE_CONFIG_BONJOUR",         req.bonjour,           "bonjour")
     if req.suggestversion    is not None: _so("MUMBLE_CONFIG_SUGGESTVERSION",  req.suggestversion,    "suggestversion")
-    if req.suggestpositional is not None: _sb("MUMBLE_CONFIG_SUGGESTPOSITIONAL",req.suggestpositional,"suggestpositional")
-    if req.suggestpushtotalk is not None: _sb("MUMBLE_CONFIG_SUGGESTPUSHTOTALK",req.suggestpushtotalk,"suggestpushtotalk")
+    if req.suggestpositional    is not None: _sb("MUMBLE_CONFIG_SUGGESTPOSITIONAL",   req.suggestpositional,    "suggestpositional")
+    if req.suggestpushtotalk    is not None: _sb("MUMBLE_CONFIG_SUGGESTPUSHTOTALK",   req.suggestpushtotalk,    "suggestpushtotalk")
+    if req.channelnestinglimit  is not None: _s( "MUMBLE_CONFIG_CHANNELNESTINGLIMIT", req.channelnestinglimit,  "channelnestinglimit")
+    if req.allowping            is not None: _sb("MUMBLE_CONFIG_ALLOWPING",           req.allowping,            "allowping")
+    if req.username             is not None: _so("MUMBLE_CONFIG_USERNAME",            req.username,             "username")
+    if req.channelname          is not None: _so("MUMBLE_CONFIG_CHANNELNAME",         req.channelname,          "channelname")
 
     if not updated:
         return {"ok": True, "note": "nothing to update"}
