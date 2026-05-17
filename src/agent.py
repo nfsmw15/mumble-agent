@@ -769,6 +769,12 @@ async def upgrade_server(cid: str, authorization: str = Header(default=None)) ->
         except Exception as e:
             print(f"[mumble-agent] DB-Vorbereinigung fehlgeschlagen (nicht kritisch): {e}", flush=True)
     old_env = _env_map(c)
+    # ICE-Port immer korrekt setzen (auch wenn alter Container ihn nicht hatte)
+    try:
+        mumble_port = int(c.labels.get("mumble-agent.port", "64738"))
+        old_env["MUMBLE_CONFIG_ICE"] = f"tcp -h 127.0.0.1 -p {_ice_port_for_port(mumble_port)}"
+    except Exception:
+        pass
     new_c = _recreate_container(c, old_env)
     return {"ok": True, "container_id": new_c.id, "image": DOCKER_IMAGE}
 
