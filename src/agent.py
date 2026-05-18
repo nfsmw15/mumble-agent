@@ -504,7 +504,7 @@ def _recreate_container(c, new_env: dict[str, str],
         raise HTTPException(500, detail=f"rename failed: {e}")
 
     try:
-        c.stop(timeout=10)
+        c.stop(timeout=5)
     except APIError as e:
         try: c.rename(old_name)
         except Exception: pass

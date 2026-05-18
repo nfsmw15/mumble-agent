@@ -2,6 +2,21 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.10.3] — 2026-05-18
+
+### Behoben
+- `_recreate_container`: Container-Stop-Timeout 10s → 5s — verhindert dass Upgrade länger als MySQL `wait_timeout` (10s) dauert
+- `setup.sh`: `/etc/mumble-agent` und `agent.env` gehören jetzt Gruppe `docker` statt `mumble-agent` — der Prozess läuft via `Group=docker` in der systemd-Unit
+
+---
+
+## [v2.10.2] — 2026-05-18
+
+### Behoben
+- `agent.env` Gruppe auf `docker` gesetzt (manuell für bestehende Installationen nötig)
+
+---
+
 ## [v2.10.1] — 2026-05-18
 
 ### Performance

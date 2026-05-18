@@ -31,7 +31,7 @@ usermod -aG docker "$USER"
 echo "[3/8] Verzeichnisse anlegen..."
 install -d -m 0750 -o "$USER" -g "$USER" "$INSTALL_DIR"
 install -d -m 0750 -o "$USER" -g "$USER" "$DATA_DIR"
-install -d -m 0750 -o root    -g "$USER" "$CONFIG_DIR"
+install -d -m 0750 -o root    -g docker  "$CONFIG_DIR"
 
 echo "[4/8] Code kopieren..."
 cp "$SCRIPT_DIR/src/agent.py" "$INSTALL_DIR/"
@@ -83,7 +83,7 @@ MUMBLE_AGENT_HOST=$AGENT_HOST
 MUMBLE_AGENT_PORT=8000
 EOF
     chmod 0660 "$CONFIG_DIR/agent.env"
-    chown root:"$USER" "$CONFIG_DIR/agent.env"
+    chown root:docker "$CONFIG_DIR/agent.env"
     echo
     echo "  >>> Generierter Agent-Token (für Easy2-Mumble Host-Eintrag):"
     echo "  >>> $TOKEN"
