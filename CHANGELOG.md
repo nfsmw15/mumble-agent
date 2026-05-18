@@ -2,6 +2,13 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.11.0] — 2026-05-18
+
+### Behoben
+- `create_server`: Image wird vor `containers.run()` per `run_in_executor` gepullt wenn nicht gecacht — verhindert dass der blockierende Pull die MySQL-Verbindung auf PHP-Seite durch `wait_timeout` tötet
+
+---
+
 ## [v2.10.3] — 2026-05-18
 
 ### Behoben

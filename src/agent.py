@@ -703,6 +703,15 @@ async def create_server(req: CreateServerRequest,
     name     = _container_name(req.external_id, req.port)
     data_dir = _data_dir(name)
     os.makedirs(data_dir, mode=0o750, exist_ok=True)
+    # Image vorab ziehen damit containers.run() nicht blockiert
+    try:
+        docker_client.images.get(DOCKER_IMAGE)
+    except docker.errors.ImageNotFound:
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: docker_client.images.pull(DOCKER_IMAGE))
+        except APIError as e:
+            raise HTTPException(500, detail=f"image pull fehlgeschlagen: {e}")
     try:
         c = docker_client.containers.run(
             image=DOCKER_IMAGE, name=name, detach=True,
