@@ -2,6 +2,17 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.12.0] — 2026-05-19
+
+### Geändert
+- `/v1/servers/{cid}/dashboard`: optionaler Query-Parameter `?resources=true` — ohne Flag kein `container.stats()` (schnell, ~2s); mit Flag inkl. CPU/RAM (langsam, für Cron)
+- `_dashboard_sync()`: `with_resources`-Parameter steuert ob `container.stats()` aufgerufen wird
+
+### Behoben
+- CPU/RAM-Berechnung: cgroup v2 Kompatibilität — `system_cpu_usage` optional, `inactive_file` als Fallback für `cache` bei RAM-Berechnung
+
+---
+
 ## [v2.11.0] — 2026-05-18
 
 ### Behoben

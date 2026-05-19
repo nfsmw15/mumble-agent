@@ -897,7 +897,7 @@ async def server_stats(cid: str, authorization: str = Header(default=None)) -> d
             "status": c.status, "started_at": started_at,
             "image": c.attrs.get("Config", {}).get("Image", "")}
 
-def _dashboard_sync(c) -> dict:
+def _dashboard_sync(c, with_resources: bool = False) -> dict:
     """Alle blockierenden Calls für einen Container — wird im Thread-Pool ausgeführt."""
     started_at  = c.attrs.get("State", {}).get("StartedAt", "")
     uptime_secs = 0
@@ -924,6 +924,35 @@ def _dashboard_sync(c) -> dict:
         except Exception:
             pass
 
+    cpu_percent = 0.0
+    mem_mb      = 0.0
+    if with_resources and c.status == "running":
+        try:
+            st    = c.stats(stream=False)
+            cpu_s = st.get("cpu_stats", {})
+            pre_s = st.get("precpu_stats", {})
+            cpu_d = (cpu_s.get("cpu_usage", {}).get("total_usage", 0)
+                   - pre_s.get("cpu_usage", {}).get("total_usage", 0))
+            ncpu  = (cpu_s.get("online_cpus")
+                     or len(cpu_s.get("cpu_usage", {}).get("percpu_usage", []))
+                     or 1)
+            # cgroup v2 hat kein system_cpu_usage → Fallback auf nanosekunden-basiert
+            sys_d = (cpu_s.get("system_cpu_usage", 0)
+                   - pre_s.get("system_cpu_usage", 0))
+            if sys_d > 0 and cpu_d >= 0:
+                cpu_percent = round(cpu_d / sys_d * ncpu * 100.0, 1)
+            elif cpu_d > 0:
+                # cgroup v2: system_cpu_usage fehlt, Zeit-Delta aus online_cpus schätzen
+                cpu_percent = round(min(cpu_d / 1e9 / 1.0 * 100.0, 100.0 * ncpu), 1)
+            mem_stats = st.get("memory_stats", {})
+            mem_use   = mem_stats.get("usage", 0)
+            # cgroup v1: cache; cgroup v2: inactive_file
+            mem_cache = (mem_stats.get("stats", {}).get("cache")
+                         or mem_stats.get("stats", {}).get("inactive_file", 0))
+            mem_mb    = round(max(mem_use - mem_cache, 0) / 1048576, 1)
+        except Exception:
+            pass
+
     return {
         "status":        c.status,
         "uptime_secs":   uptime_secs,
@@ -931,15 +960,16 @@ def _dashboard_sync(c) -> dict:
         "user_count":    len(users_list),
         "channel_count": channel_count,
         "ban_count":     ban_count,
-        "cpu_percent":   0.0,
-        "mem_mb":        0.0,
+        "cpu_percent":   cpu_percent,
+        "mem_mb":        mem_mb,
         "net_rx_mb":     0.0,
         "net_tx_mb":     0.0,
     }
 
 @app.get("/v1/servers/{cid}/dashboard")
-async def server_dashboard(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Dashboard-Daten: ICE-Stats + Docker-Ressourcen in einem Aufruf."""
+async def server_dashboard(cid: str, resources: bool = False,
+                           authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Dashboard-Daten: ICE-Stats; mit ?resources=true auch CPU/RAM (langsamer)."""
     check_token(authorization)
     assert docker_client is not None
     try:
@@ -948,7 +978,7 @@ async def server_dashboard(cid: str, authorization: str = Header(default=None)) 
     except NotFound:
         raise HTTPException(404, detail="container not found")
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, _dashboard_sync, c)
+    data = await loop.run_in_executor(None, _dashboard_sync, c, resources)
     return {"ok": True, "data": data}
 
 @app.get("/v1/servers/{cid}/viewer")
