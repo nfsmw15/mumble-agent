@@ -2,7 +2,15 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
-## [v2.12.0] — 2026-05-19
+## [v2.12.0] — 2026-05-24
+
+### Hinzugefügt
+- **`GET /v1/servers`**: Neuer Endpoint — listet alle verwalteten Container (Label `mumble-agent.managed=1`) mit `container_id`, `name`, `port`, `status`, `image`, `external_id`, `max_users`, `welcome_text`, `password`
+- Servername-Fallback-Kette: `mumble-agent.name` Label → `MUMBLE_CONFIG_REGISTER_NAME` Env-Var → `registername` aus SQLite-DB via `docker exec sqlite3` → Container-Name
+
+---
+
+## [v2.11.0] — 2026-05-19
 
 ### Geändert
 - `/v1/servers/{cid}/dashboard`: optionaler Query-Parameter `?resources=true` — ohne Flag kein `container.stats()` (schnell, ~2s); mit Flag inkl. CPU/RAM (langsam, für Cron)
@@ -13,7 +21,7 @@ Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
 ---
 
-## [v2.11.0] — 2026-05-18
+## [v2.10.4] — 2026-05-18
 
 ### Behoben
 - `create_server`: Image wird vor `containers.run()` per `run_in_executor` gepullt wenn nicht gecacht — verhindert dass der blockierende Pull die MySQL-Verbindung auf PHP-Seite durch `wait_timeout` tötet
