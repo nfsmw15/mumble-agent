@@ -2,6 +2,14 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.13.0] — 2026-05-24
+
+### Hinzugefügt
+- **`GET /v1/servers`**: Neuer Endpoint — listet alle verwalteten Container (Label `mumble-agent.managed=1`) mit `container_id`, `name`, `port`, `status`, `image`, `external_id`, `max_users`, `welcome_text`, `password`
+- Servername-Fallback-Kette: `mumble-agent.name` Label → `MUMBLE_CONFIG_REGISTER_NAME` Env-Var → `registername` aus SQLite-DB via `docker exec sqlite3` → Container-Name
+
+---
+
 ## [v2.12.0] — 2026-05-19
 
 ### Geändert

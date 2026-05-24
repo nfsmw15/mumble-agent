@@ -695,6 +695,48 @@ async def update_image(req: UpdateImageRequest,
     asyncio.get_event_loop().call_later(1.0, lambda: sys.exit(0))
     return {"ok": True, "image": req.image, "restarting": True}
 
+@app.get("/v1/servers")
+async def list_servers(authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Listet alle vom Agent verwalteten Container (Label mumble-agent.managed=1)."""
+    check_token(authorization)
+    assert docker_client is not None
+    containers = docker_client.containers.list(
+        all=True, filters={"label": f"{LABEL_KEY}=1"})
+    servers = []
+    for c in containers:
+        labels = c.labels
+        env    = _env_map(c)
+        port   = int(labels.get("mumble-agent.port",
+                     env.get("MUMBLE_CONFIG_PORT", "0") or "0"))
+        name = (labels.get("mumble-agent.name")
+                or env.get("MUMBLE_CONFIG_REGISTER_NAME")
+                or "")
+        if not name and c.status == "running":
+            try:
+                _res = c.exec_run(
+                    ["sqlite3", "/data/mumble-server.sqlite",
+                     "SELECT config_value FROM config WHERE config_name='registername' LIMIT 1;"],
+                    demux=False
+                )
+                if _res.exit_code == 0 and _res.output:
+                    name = _res.output.decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+        if not name:
+            name = c.name.lstrip("/")
+        servers.append({
+            "container_id": c.id,
+            "name":         name,
+            "port":         port,
+            "status":       c.status,
+            "image":        c.image.tags[0] if c.image.tags else "",
+            "external_id":  int(labels.get("mumble-agent.external_id", "0") or "0"),
+            "max_users":    int(env.get("MUMBLE_CONFIG_USERS", "10") or "10"),
+            "welcome_text": env.get("MUMBLE_CONFIG_WELCOMETEXT", ""),
+            "password":     env.get("MUMBLE_CONFIG_SERVERPASSWORD", ""),
+        })
+    return {"ok": True, "servers": servers}
+
 @app.post("/v1/servers")
 async def create_server(req: CreateServerRequest,
                         authorization: str = Header(default=None)) -> dict[str, Any]:
