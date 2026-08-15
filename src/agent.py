@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.10.0"
+AGENT_VERSION = "2.13.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -47,6 +47,41 @@ if not AGENT_TOKEN:
     raise RuntimeError("MUMBLE_AGENT_TOKEN nicht gesetzt.")
 
 docker_client: docker.DockerClient | None = None
+
+# ── Speicher-Hygiene ─────────────────────────────────────────────────────────
+# Ohne das wächst RSS über Wochen auf mehrere hundert MB an, obwohl der Prozess
+# kaum Live-Daten hält: glibc gibt fragmentierte Heap-Bereiche fast nie ans OS
+# zurück, und Transparent Huge Pages halten dabei ganze 2MB-Blöcke resident,
+# solange auch nur ein Byte darin noch benutzt wird.
+def _disable_thp() -> None:
+    """Deaktiviert Transparent Huge Pages nur für diesen Prozess (PR_SET_THP_DISABLE)."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_THP_DISABLE = 41
+        libc.prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)
+    except Exception as e:
+        print(f"[mumble-agent] THP-Deaktivierung fehlgeschlagen (nicht kritisch): {e}", flush=True)
+
+_disable_thp()
+
+_MALLOC_TRIM_INTERVAL = 1800  # 30 Minuten
+
+def _malloc_trim() -> None:
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+async def _malloc_trim_loop() -> None:
+    """Gibt periodisch fragmentierten, aber ungenutzten Heap ans OS zurück."""
+    import gc
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(_MALLOC_TRIM_INTERVAL)
+        gc.collect()
+        await loop.run_in_executor(None, _malloc_trim)
 
 # ── Update-Check ──────────────────────────────────────────────────────────────
 _UPDATE_INTERVAL = 24 * 3600  # einmal täglich
@@ -108,9 +143,11 @@ async def lifespan(_: FastAPI):
     _init_ice()
     docker_client = docker.from_env()
     os.makedirs(DATA_ROOT, mode=0o750, exist_ok=True)
-    task = asyncio.create_task(_update_check_loop())
+    task       = asyncio.create_task(_update_check_loop())
+    trim_task  = asyncio.create_task(_malloc_trim_loop())
     yield
     task.cancel()
+    trim_task.cancel()
     if docker_client is not None:
         docker_client.close()
 

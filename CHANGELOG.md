@@ -2,6 +2,16 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.13.0] — 2026-08-15
+
+### Performance
+- **RSS-Wachstum behoben**: Agent-Prozess sammelte über Wochen glibc-Heap-Fragmentierung an (RSS bis 1.4GB bei 5 schlanken Containern mit zusammen <100MB) — verstärkt durch Transparent Huge Pages, die fragmentierte Bereiche in 2MB-Blöcken resident halten
+- Transparent Huge Pages für den Agent-Prozess deaktiviert (`prctl(PR_SET_THP_DISABLE)`, betrifft nur diesen Prozess)
+- Periodischer `malloc_trim(0)` + `gc.collect()` alle 30 Minuten im Hintergrund — gibt fragmentierten Heap ans OS zurück
+- systemd-Unit: `MALLOC_ARENA_MAX=2` begrenzt glibc-Arenen
+
+---
+
 ## [v2.12.0] — 2026-05-24
 
 ### Hinzugefügt

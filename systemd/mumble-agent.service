@@ -10,6 +10,7 @@ Type=exec
 User=mumble-agent
 Group=docker
 EnvironmentFile=/etc/mumble-agent/agent.env
+Environment=MALLOC_ARENA_MAX=2
 WorkingDirectory=/opt/mumble-agent
 ExecStart=/opt/mumble-agent/venv/bin/uvicorn agent:app \
   --host ${MUMBLE_AGENT_HOST} \
