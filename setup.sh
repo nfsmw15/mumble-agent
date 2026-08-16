@@ -85,7 +85,7 @@ EOF
     chmod 0660 "$CONFIG_DIR/agent.env"
     chown root:docker "$CONFIG_DIR/agent.env"
     echo
-    echo "  >>> Generierter Agent-Token (für Easy2-Mumble Host-Eintrag):"
+    echo "  >>> Generierter Agent-Token (für esse-mumble Host-Eintrag):"
     echo "  >>> $TOKEN"
     echo
 else
@@ -139,7 +139,7 @@ case "$NET_CHOICE" in
 1)
     echo "  Netzwerk-Modus: Internes Netz / LAN (kein Proxy)"
     echo
-    echo "  In der Easy2-Mumble Weboberfläche eintragen:"
+    echo "  In der esse-mumble Weboberfläche eintragen:"
     echo "    Agent-URL:   http://${INTERNAL_IP}:8000"
     echo "    Agent-Token: $TOKEN"
     ;;
@@ -150,7 +150,7 @@ case "$NET_CHOICE" in
     echo "  auf Port 8443 hört und an http://127.0.0.1:8000 weiterleitet."
     echo "  Beispiele: siehe README.md"
     echo
-    echo "  In der Easy2-Mumble Weboberfläche eintragen:"
+    echo "  In der esse-mumble Weboberfläche eintragen:"
     echo "    Agent-URL:   https://<dein-hostname>:8443"
     echo "    Agent-Token: $TOKEN"
     ;;
@@ -160,7 +160,7 @@ case "$NET_CHOICE" in
     echo "  Proxy so konfigurieren dass er an http://${INTERNAL_IP}:8000"
     echo "  weiterleitet. Beispiele: siehe README.md"
     echo
-    echo "  In der Easy2-Mumble Weboberfläche eintragen:"
+    echo "  In der esse-mumble Weboberfläche eintragen:"
     echo "    Agent-URL:   https://<dein-hostname>"
     echo "    Agent-Token: $TOKEN"
     ;;

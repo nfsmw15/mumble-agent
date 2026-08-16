@@ -2,15 +2,15 @@
 
 Leichtgewichtiger FastAPI-Service zum Verwalten von Mumble-Servern als Docker-Container auf einem Linux-Host.
 
-Gehört zu [Easy2-Mumble](https://github.com/nfsmw15/easy2-mumble) — der Webserver-Erweiterung für [Easy2-PHP8](https://github.com/nfsmw15/Easy2-PHP8) (`main-dashboard`).
+Gehört zu [esse-mumble](https://github.com/nfsmw15/esse-mumble) — dem Verwaltungsplugin für [esse-cms](https://github.com/nfsmw15/esse-cms) (`esse-dashboard`).
 
 ## Was macht der Agent?
 
-Auf jedem Mumble-Host läuft eine Instanz des `mumble-agent`. Er nimmt HTTP/HTTPS-Requests vom Easy2-Webserver entgegen (Bearer-Token authentifiziert) und steuert lokal die Docker-Container der einzelnen Mumble-Server.
+Auf jedem Mumble-Host läuft eine Instanz des `mumble-agent`. Er nimmt HTTP/HTTPS-Requests vom esse-cms-Webserver entgegen (Bearer-Token authentifiziert) und steuert lokal die Docker-Container der einzelnen Mumble-Server.
 
 ```
 ┌───────────────────┐  HTTPS+Token  ┌─────────────────────────┐
-│ Easy2-Mumble      │  ───────────► │ mumble-agent (FastAPI)  │
+│ esse-mumble       │  ───────────► │ mumble-agent (FastAPI)  │
 │ (PHP-Webserver)   │               │   ↓ Docker-API           │
 └───────────────────┘               │ mumble-server containers │
                                     └─────────────────────────┘
@@ -144,7 +144,7 @@ sudo systemctl status mumble-agent
 Standard nach Setup: `MUMBLE_AGENT_HOST=0.0.0.0` — der Agent ist direkt per interner IP erreichbar. Im Webinterface `http://192.168.x.x:8000` als Agent-URL eintragen. Der Bearer-Token schützt den Zugang.
 
 ```
-[Easy2-Webserver] ──HTTP──► [mumble-host:8000]
+[esse-cms] ──HTTP──► [mumble-host:8000]
 ```
 
 ### Szenario 2: Reverse-Proxy auf demselben Host
@@ -152,7 +152,7 @@ Standard nach Setup: `MUMBLE_AGENT_HOST=0.0.0.0` — der Agent ist direkt per in
 Proxy läuft auf dem Mumble-Host selbst. Agent auf `127.0.0.1` beschränken:
 
 ```
-[Easy2-Webserver] ──HTTPS──► [mumble-host:443/8443 → 127.0.0.1:8000]
+[esse-cms] ──HTTPS──► [mumble-host:443/8443 → 127.0.0.1:8000]
 ```
 
 In `agent.env`: `MUMBLE_AGENT_HOST=127.0.0.1`
@@ -162,7 +162,7 @@ In `agent.env`: `MUMBLE_AGENT_HOST=127.0.0.1`
 Proxy läuft in einem eigenen LXC oder einer eigenen VM und leitet an die interne IP des Mumble-Hosts weiter. Agent bleibt auf `0.0.0.0` oder wird auf die interne IP gebunden:
 
 ```
-[Easy2-Webserver] ──HTTPS──► [Proxy-LXC:443 → mumble-host:8000]
+[esse-cms] ──HTTPS──► [Proxy-LXC:443 → mumble-host:8000]
 ```
 
 Das ist das empfohlene Setup wenn bereits ein zentraler Reverse-Proxy für mehrere Dienste existiert.
