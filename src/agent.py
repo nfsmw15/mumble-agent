@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.14.0"
+AGENT_VERSION = "2.15.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -157,7 +157,105 @@ async def _update_check_loop() -> None:
             _update_cache["latest"]     = _pick_latest(tags, _update_cache.get("prereleases") or {}, UPDATE_CHANNEL)
             _update_cache["checked_at"] = int(time.time())
             print(f"[mumble-agent] Neuestes stabiles Image: {_update_cache['latest']}", flush=True)
+        agent_release = await loop.run_in_executor(None, _fetch_latest_agent_release)
+        if agent_release:
+            _agent_update_cache.update(agent_release, checked_at=int(time.time()))
         await asyncio.sleep(_UPDATE_INTERVAL)
+
+
+# ── Agent-Self-Update ──────────────────────────────────────────────────────────
+AGENT_REPO      = "nfsmw15/mumble-agent"
+AGENT_SELF_PATH = os.path.abspath(__file__)
+_agent_update_cache: dict[str, Any] = {"version": None, "tarball_url": None, "checked_at": 0}
+
+def _parse_semver(v: str) -> tuple[int, int, int] | None:
+    """Parst 'X.Y.Z' oder 'vX.Y.Z' (Agent-eigene Versionsstrings, kein Docker-Image-Tag)."""
+    m = re.match(r'^v?(\d+)\.(\d+)\.(\d+)$', v)
+    return tuple(int(g) for g in m.groups()) if m else None
+
+def _codeload_url(version: str) -> str:
+    """Direkter codeload.github.com-Link statt des tarball_url-Felds aus der Release-API
+    (api.github.com/repos/.../tarball/{ref} ist unzuverlässig, liefert gelegentlich 504 —
+    live beobachtet, codeload.github.com direkt funktioniert zuverlässig)."""
+    return f"https://codeload.github.com/{AGENT_REPO}/tar.gz/refs/tags/v{version}"
+
+def _fetch_latest_agent_release() -> dict[str, Any] | None:
+    """Fragt GitHub nach dem neuesten (nicht-Pre-/Draft-)Release von mumble-agent selbst.
+    /releases/latest liefert genau das automatisch, keine eigene Filterung nötig."""
+    url = f"https://api.github.com/repos/{AGENT_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        tag = data.get("tag_name", "")
+        if not _parse_semver(tag):
+            return None
+        version = tag.lstrip("v")
+        return {"version": version, "tarball_url": _codeload_url(version)}
+    except Exception as e:
+        print(f"[mumble-agent] Agent-Update-Check fehlgeschlagen: {e}", flush=True)
+    return None
+
+def _fetch_agent_release_by_version(version: str) -> dict[str, Any] | None:
+    """Prüft über die Release-API ob die Version existiert (sauberer 404 bei Tippfehlern),
+    lädt aber über codeload.github.com herunter, s. _codeload_url()."""
+    url = f"https://api.github.com/repos/{AGENT_REPO}/releases/tags/v{version}"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            json.loads(resp.read())
+        return {"version": version, "tarball_url": _codeload_url(version)}
+    except Exception:
+        return None
+
+def _apply_agent_update(tarball_url: str) -> str:
+    """Lädt das Release-Tarball, validiert agent.py (Syntax) und requirements.txt
+    (muss unverändert sein — neue Abhängigkeiten würden den Agent sonst crash-loopen
+    lassen, ohne dass hier ein pip install passiert), schreibt erst nach bestandener
+    Prüfung. Backup der alten agent.py bleibt als agent.py.bak liegen.
+    Gibt bei Erfolg "" zurück, sonst eine Fehlermeldung."""
+    import tarfile
+    try:
+        with urllib.request.urlopen(tarball_url, timeout=30) as resp:
+            data = resp.read()
+    except Exception as e:
+        return f"Download fehlgeschlagen: {e}"
+
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+        agent_member = next((m for m in tar.getmembers() if m.name.endswith("src/agent.py")), None)
+        req_member   = next((m for m in tar.getmembers() if m.name.endswith("src/requirements.txt")), None)
+        if agent_member is None:
+            return "src/agent.py nicht im Release-Archiv gefunden"
+        new_code = tar.extractfile(agent_member).read().decode("utf-8")
+    except Exception as e:
+        return f"Archiv-Extraktion fehlgeschlagen: {e}"
+
+    try:
+        compile(new_code, "<agent-update>", "exec")
+    except SyntaxError as e:
+        return f"Neue agent.py ist syntaktisch ungültig: {e}"
+
+    if req_member is not None:
+        new_req = tar.extractfile(req_member).read().decode("utf-8")
+        req_path = os.path.join(os.path.dirname(AGENT_SELF_PATH), "requirements.txt")
+        try:
+            with open(req_path, encoding="utf-8") as f:
+                current_req = f.read()
+        except OSError:
+            current_req = ""
+        if new_req.strip() != current_req.strip():
+            return ("requirements.txt hat sich geändert — bitte manuell aktualisieren "
+                    "(neue Abhängigkeiten würden den Agent sonst nach dem Neustart "
+                    "crash-loopen lassen, ohne dass hier automatisch pip install läuft)")
+
+    try:
+        shutil.copy2(AGENT_SELF_PATH, AGENT_SELF_PATH + ".bak")
+        with open(AGENT_SELF_PATH, "w", encoding="utf-8") as f:
+            f.write(new_code)
+    except OSError as e:
+        return f"Schreiben fehlgeschlagen: {e}"
+    return ""
 
 # ── ICE-Setup ────────────────────────────────────────────────────────────────
 _MumbleServer = None   # nach _init_ice() gesetzt
@@ -370,12 +468,15 @@ class SetBansRequest(BaseModel):
 class UpdateImageRequest(BaseModel):
     image: str = Field(..., min_length=1, max_length=256)
 
-class UpdateChannelRequest(BaseModel):
+class AgentChannelRequest(BaseModel):
     channel: str = Field(pattern=r'^(stable|prerelease)$')
 
 class UpgradeRequest(BaseModel):
     image: str | None = Field(default=None, pattern=_MUMBLE_IMAGE_RE)
     force: bool        = Field(default=False)
+
+class AgentUpdateRequest(BaseModel):
+    version: str | None = Field(default=None, pattern=r'^\d+\.\d+\.\d+$')
 
 
 # ── Docker-Helpers ────────────────────────────────────────────────────────────
@@ -771,6 +872,12 @@ async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
     # (Pre-Release, numerisch neuer als die empfohlene stabile Version) fälschlich
     # als "Update verfügbar" gemeldet, obwohl das ein Downgrade wäre.
     update_available = bool(latest_v and current_v and latest_v > current_v)
+
+    agent_latest    = _agent_update_cache.get("version")
+    agent_latest_v  = _parse_semver(agent_latest) if agent_latest else None
+    agent_current_v = _parse_semver(AGENT_VERSION)
+    agent_update_available = bool(agent_latest_v and agent_current_v and agent_latest_v > agent_current_v)
+
     return {
         "ok": True, "agent": "mumble-agent", "version": AGENT_VERSION,
         "ice": _MumbleServer is not None,
@@ -780,6 +887,8 @@ async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
         "latest_image":   latest,
         "update_available": update_available,
         "update_channel": UPDATE_CHANNEL,
+        "agent_latest_version":   agent_latest,
+        "agent_update_available": agent_update_available,
     }
 
 def _write_agent_env(key: str, value: str) -> None:
@@ -815,14 +924,44 @@ async def update_image(req: UpdateImageRequest,
     return {"ok": True, "image": req.image, "restarting": True}
 
 @app.post("/v1/channel")
-async def update_channel(req: UpdateChannelRequest,
-                         authorization: str = Header(default=None)) -> dict[str, Any]:
+async def set_agent_channel(req: AgentChannelRequest,
+                            authorization: str = Header(default=None)) -> dict[str, Any]:
     """Aktualisiert MUMBLE_AGENT_UPDATE_CHANNEL in agent.env und startet den Agent neu."""
     check_token(authorization)
     _write_agent_env("MUMBLE_AGENT_UPDATE_CHANNEL", req.channel)
     print(f"[mumble-agent] Update-Kanal geändert auf {req.channel} — starte neu…", flush=True)
     asyncio.get_event_loop().call_later(1.0, lambda: sys.exit(0))
     return {"ok": True, "channel": req.channel, "restarting": True}
+
+@app.post("/v1/agent/update")
+async def update_agent(req: AgentUpdateRequest | None = None,
+                       authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Aktualisiert den Agent selbst auf ein GitHub-Release (Tarball, kein git nötig).
+    Ohne req.version wird das neueste Release verwendet. Validiert die neue agent.py
+    (Syntax) vor dem Schreiben, lehnt ab wenn requirements.txt sich geändert hat
+    (keine automatischen pip installs), behält die alte Version als agent.py.bak."""
+    check_token(authorization)
+    version = req.version if req else None
+    if version:
+        release = await asyncio.get_event_loop().run_in_executor(
+            None, _fetch_agent_release_by_version, version)
+        if release is None:
+            raise HTTPException(404, detail=f"Release v{version} nicht gefunden")
+    else:
+        release = dict(_agent_update_cache) if _agent_update_cache.get("tarball_url") else None
+        if release is None:
+            release = await asyncio.get_event_loop().run_in_executor(None, _fetch_latest_agent_release)
+        if release is None:
+            raise HTTPException(503, detail="Konnte kein Release von GitHub abfragen")
+
+    error = await asyncio.get_event_loop().run_in_executor(
+        None, _apply_agent_update, release["tarball_url"])
+    if error:
+        raise HTTPException(500, detail=error)
+
+    print(f"[mumble-agent] Agent aktualisiert auf v{release['version']} — starte neu…", flush=True)
+    asyncio.get_event_loop().call_later(1.0, lambda: sys.exit(0))
+    return {"ok": True, "version": release["version"], "restarting": True}
 
 @app.get("/v1/images")
 async def list_images(authorization: str = Header(default=None)) -> dict[str, Any]:

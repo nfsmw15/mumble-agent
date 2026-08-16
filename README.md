@@ -77,7 +77,7 @@ MUMBLE_CONFIG_ICE=tcp -h 127.0.0.1 -p 6502
 - Constant-time Vergleich (`secrets.compare_digest`)
 - Container-Label-Guard: nur Container mit `mumble-agent.managed=1` werden angefasst
 - Service läuft als unprivilegierter User `mumble-agent`, **benötigt aber Docker-Socket-Zugriff** (Gruppe `docker`) — effektiv host-root-fähig für Container-Operationen
-- systemd-Hardening (`ProtectSystem=strict`, `NoNewPrivileges` etc.)
+- systemd-Hardening (`ProtectSystem=strict`, `NoNewPrivileges` etc.) — `/opt/mumble-agent` ist als `ReadWritePaths` freigegeben, damit `POST /v1/agent/update` sich selbst überschreiben kann; da der Prozess ohnehin Docker-Socket-Zugriff hat (siehe oben), ist das kein zusätzlicher Rechte-Sprung, nur ein zusätzlicher Schreibpfad
 - Listen-Adresse über `MUMBLE_AGENT_HOST` konfigurierbar (`0.0.0.0` = direkt per interner IP, `127.0.0.1` = nur mit Reverse-Proxy)
 
 ## Voraussetzungen

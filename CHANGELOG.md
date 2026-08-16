@@ -2,6 +2,17 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.15.0] — 2026-08-16
+
+### Hinzugefügt
+- **Agent-Self-Update**: `POST /v1/agent/update` (optional `{"version": "X.Y.Z"}`, sonst neuestes Release) lädt den Agent-Code als GitHub-Release-Tarball, validiert die neue `agent.py` (Syntax-Check) und lehnt ab falls sich `requirements.txt` geändert hat (kein automatisches `pip install`, würde sonst nach dem Neustart crash-loopen). Alte `agent.py` bleibt als `agent.py.bak` liegen. `GET /v1/ping` liefert zusätzlich `agent_latest_version`/`agent_update_available` (echter Versionsvergleich, analog zum Mumble-Image-Kanal), im selben 24h-Rhythmus gecacht
+- Kein `git`/SSH mehr nötig, um den Agent selbst zu aktualisieren — bisher nur per Hand (`git pull` + Neustart) möglich
+
+### Behoben
+- **Kritisch**: `UpdateChannelRequest` war doppelt vergeben — einmal für `PATCH /v1/servers/{cid}/channels/{channel_id}` (Mumble-Channel umbenennen, seit v1.x) und einmal für den neuen Update-Kanal aus v2.14.0. Wegen `from __future__ import annotations` (verzögerte Annotation-Auflösung) gewann die zuletzt definierte Klasse für **beide** Endpoints — das Umbenennen von Mumble-Channels validierte seit v2.14.0 fälschlich gegen `{"channel": "stable"|"prerelease"}` statt `{name, description, position, parent}` und war damit faktisch kaputt. Umbenannt zu `AgentChannelRequest` (Modell) und `set_agent_channel` (Funktion), keine Namenskollision mehr
+
+---
+
 ## [v2.14.0] — 2026-08-16
 
 Versionsauswahl beim Server-Upgrade/-Erstellung, für das esse-mumble-Plugin.
