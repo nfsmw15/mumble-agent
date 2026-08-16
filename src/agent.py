@@ -34,7 +34,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.13.0"
+AGENT_VERSION = "2.14.0"
 
 AGENT_TOKEN    = os.environ.get("MUMBLE_AGENT_TOKEN", "")
 DOCKER_IMAGE   = os.environ.get("MUMBLE_AGENT_IMAGE", "mumblevoip/mumble-server:v1.6.870")
@@ -42,6 +42,13 @@ DOCKER_NETWORK = os.environ.get("MUMBLE_AGENT_NETWORK", "host")
 DATA_ROOT      = os.environ.get("MUMBLE_AGENT_DATA", "/var/lib/mumble-agent")
 LABEL_KEY      = "mumble-agent.managed"
 INI_PATH       = "/data/mumble_server_config.ini"
+
+# "stable": GitHub-Pre-Releases werden bei _pick_latest() und in GET /v1/images
+# komplett ausgeblendet. "prerelease": nichts wird gefiltert, die höchste Version
+# überhaupt zählt als "latest" — auch wenn das eine Pre-Release ist.
+UPDATE_CHANNEL = os.environ.get("MUMBLE_AGENT_UPDATE_CHANNEL", "stable")
+if UPDATE_CHANNEL not in ("stable", "prerelease"):
+    UPDATE_CHANNEL = "stable"
 
 if not AGENT_TOKEN:
     raise RuntimeError("MUMBLE_AGENT_TOKEN nicht gesetzt.")
@@ -85,31 +92,71 @@ async def _malloc_trim_loop() -> None:
 
 # ── Update-Check ──────────────────────────────────────────────────────────────
 _UPDATE_INTERVAL = 24 * 3600  # einmal täglich
-_update_cache: dict[str, Any] = {"latest": None, "checked_at": 0}
+_update_cache: dict[str, Any] = {"latest": None, "checked_at": 0, "tags": [], "prereleases": {}}
 
-def _fetch_latest_image() -> str | None:
-    """Fragt Docker Hub nach dem neuesten versionierten Tag von mumblevoip/mumble-server."""
+def _fetch_available_tags() -> list[str] | None:
+    """Fragt Docker Hub nach allen versionierten Tags von mumblevoip/mumble-server,
+    sortiert numerisch nach Version absteigend (nicht last_updated — das garantiert
+    nicht die höchste Version, siehe v2.14.0-Changelog)."""
     url = ("https://hub.docker.com/v2/repositories/mumblevoip/mumble-server"
-           "/tags?page_size=50&ordering=last_updated")
+           "/tags?page_size=100")
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             data = json.loads(resp.read())
-        tag_re = re.compile(r'^v\d+\.\d+\.\d+$')
+        tag_re = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
+        versions: list[tuple[tuple[int, int, int], str]] = []
         for entry in data.get("results", []):
             tag = entry.get("name", "")
-            if tag_re.match(tag):
-                return f"mumblevoip/mumble-server:{tag}"
+            m = tag_re.match(tag)
+            if m:
+                versions.append((tuple(int(g) for g in m.groups()), tag))
+        versions.sort(key=lambda v: v[0], reverse=True)
+        return [f"mumblevoip/mumble-server:{tag}" for _, tag in versions]
     except Exception as e:
         print(f"[mumble-agent] Update-Check fehlgeschlagen: {e}", flush=True)
     return None
 
+def _fetch_github_prereleases() -> dict[str, bool] | None:
+    """Fragt GitHub nach dem prerelease-Flag der mumble-voip/mumble-Releases (Docker Hub
+    selbst kennt keine stable/beta-Kanäle). Öffentlich, unauthentifiziert — Rate-Limit
+    60 req/h, daher wie die Docker-Hub-Tags nur alle _UPDATE_INTERVAL neu abgefragt."""
+    url = "https://api.github.com/repos/mumble-voip/mumble/releases?per_page=100"
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        return {r["tag_name"]: bool(r.get("prerelease", False))
+                for r in data if r.get("tag_name")}
+    except Exception as e:
+        print(f"[mumble-agent] GitHub-Prerelease-Check fehlgeschlagen: {e}", flush=True)
+    return None
+
+def _pick_latest(tags: list[str], prereleases: dict[str, bool], channel: str) -> str | None:
+    """Höchste Version im gegebenen Kanal. Im prerelease-Kanal zählt einfach die
+    höchste Version. Im stable-Kanal wird die höchste Version übersprungen, die laut
+    GitHub eine Pre-Release ist — tags ist bereits absteigend sortiert, der erste
+    Treffer gewinnt. Fällt auf die höchste Version überhaupt zurück, falls im
+    stable-Kanal alle Kandidaten Pre-Releases sind oder die GitHub-Abfrage nie
+    erfolgreich war (prereleases leer) — fail open, nicht blockieren."""
+    if channel == "prerelease":
+        return tags[0] if tags else None
+    for tag in tags:
+        if not prereleases.get(tag.split(":", 1)[-1], False):
+            return tag
+    return tags[0] if tags else None
+
 async def _update_check_loop() -> None:
+    loop = asyncio.get_event_loop()
     while True:
-        latest = await asyncio.get_event_loop().run_in_executor(None, _fetch_latest_image)
-        if latest:
-            _update_cache["latest"]     = latest
+        tags        = await loop.run_in_executor(None, _fetch_available_tags)
+        prereleases = await loop.run_in_executor(None, _fetch_github_prereleases)
+        if prereleases is not None:
+            _update_cache["prereleases"] = prereleases
+        if tags:
+            _update_cache["tags"]       = tags
+            _update_cache["latest"]     = _pick_latest(tags, _update_cache.get("prereleases") or {}, UPDATE_CHANNEL)
             _update_cache["checked_at"] = int(time.time())
-            print(f"[mumble-agent] Neuestes Image: {latest}", flush=True)
+            print(f"[mumble-agent] Neuestes stabiles Image: {_update_cache['latest']}", flush=True)
         await asyncio.sleep(_UPDATE_INTERVAL)
 
 # ── ICE-Setup ────────────────────────────────────────────────────────────────
@@ -211,6 +258,11 @@ def _ice_connect(ice_port: int):
 
 # ── Pydantic-Modelle ──────────────────────────────────────────────────────────
 
+# Whitelist auf das eine Repo — bewusst strenger als das freie Pattern bei
+# POST /v1/image, da diese Modelle über breiter nutzbare Endpoints laufen und
+# kein beliebiger Image-Name pullbar sein soll.
+_MUMBLE_IMAGE_RE = r'^mumblevoip/mumble-server:v\d+\.\d+\.\d+$'
+
 class CreateServerRequest(BaseModel):
     name: str         = Field(min_length=1, max_length=64)
     port: int         = Field(ge=1024, le=65535)
@@ -218,6 +270,7 @@ class CreateServerRequest(BaseModel):
     max_users: int    = Field(default=10, ge=1, le=500)
     welcome_text: str = Field(default="", max_length=2000)
     external_id: int  = Field(default=0)
+    image: str | None = Field(default=None, pattern=_MUMBLE_IMAGE_RE)
 
 class UpdateServerRequest(BaseModel):
     name: str | None          = Field(default=None, max_length=64)
@@ -317,6 +370,13 @@ class SetBansRequest(BaseModel):
 class UpdateImageRequest(BaseModel):
     image: str = Field(..., min_length=1, max_length=256)
 
+class UpdateChannelRequest(BaseModel):
+    channel: str = Field(pattern=r'^(stable|prerelease)$')
+
+class UpgradeRequest(BaseModel):
+    image: str | None = Field(default=None, pattern=_MUMBLE_IMAGE_RE)
+    force: bool        = Field(default=False)
+
 
 # ── Docker-Helpers ────────────────────────────────────────────────────────────
 
@@ -333,6 +393,12 @@ def _container_name(external_id: int, port: int) -> str:
 
 def _data_dir(name: str) -> str:
     return os.path.join(DATA_ROOT, name.lstrip("/"))
+
+_VERSION_TAG_RE = re.compile(r':v(\d+)\.(\d+)\.(\d+)$')
+
+def _parse_version(image: str) -> tuple[int, int, int] | None:
+    m = _VERSION_TAG_RE.search(image)
+    return tuple(int(g) for g in m.groups()) if m else None
 
 def _require_managed(c) -> None:
     if c.labels.get(LABEL_KEY) != "1":
@@ -513,18 +579,20 @@ def _env_map(c) -> dict[str, str]:
     return env
 
 def _recreate_container(c, new_env: dict[str, str],
-                        new_labels: dict | None = None) -> docker.models.containers.Container:
+                        new_labels: dict | None = None,
+                        image: str | None = None) -> docker.models.containers.Container:
     old_labels  = c.labels.copy()
     old_name    = c.name.lstrip("/")
     old_port    = old_labels.get("mumble-agent.port", "")
     data_dir    = _data_dir(old_name)
     port_int    = int(old_port) if old_port.isdigit() else 64738
     use_labels  = new_labels if new_labels is not None else old_labels
+    use_image   = image or DOCKER_IMAGE
     backup_name = old_name + "_backup"
 
     def _run(name: str, env: dict, labels: dict):
         return docker_client.containers.run(
-            image=DOCKER_IMAGE, name=name, detach=True,
+            image=use_image, name=name, detach=True,
             restart_policy={"Name": "unless-stopped"},
             environment=env,
             volumes={data_dir: {"bind": "/data", "mode": "rw"}},
@@ -534,18 +602,21 @@ def _recreate_container(c, new_env: dict[str, str],
             labels=labels,
         )
 
-    # Rename old container so new one can take the canonical name
-    try:
-        c.rename(backup_name)
-    except APIError as e:
-        raise HTTPException(500, detail=f"rename failed: {e}")
-
+    # Erst stoppen, dann umbenennen: bei crash-loopenden Containern (restart_policy
+    # startet den Container laufend neu) kollidiert rename() sonst mit Dockers
+    # Netzwerk-Sandbox-Teardown/-Aufbau während des Restarts ("sandbox not found").
+    # Ein expliziter stop() unterbindet den Restart zuverlässig, bevor umbenannt wird.
     try:
         c.stop(timeout=5)
     except APIError as e:
-        try: c.rename(old_name)
-        except Exception: pass
         raise HTTPException(500, detail=f"stop failed: {e}")
+
+    try:
+        c.rename(backup_name)
+    except APIError as e:
+        try: c.start()
+        except Exception: pass
+        raise HTTPException(500, detail=f"rename failed: {e}")
 
     try:
         new_c = _run(old_name, new_env, use_labels)
@@ -693,7 +764,13 @@ def _addr_to_bytes(addr: str) -> list[int]:
 @app.get("/v1/ping")
 async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
-    latest = _update_cache["latest"]
+    latest   = _update_cache["latest"]
+    latest_v = _parse_version(latest) if latest else None
+    current_v = _parse_version(DOCKER_IMAGE)
+    # Echter Versionsvergleich statt "!=" — sonst würde z.B. ein laufendes v1.6.870
+    # (Pre-Release, numerisch neuer als die empfohlene stabile Version) fälschlich
+    # als "Update verfügbar" gemeldet, obwohl das ein Downgrade wäre.
+    update_available = bool(latest_v and current_v and latest_v > current_v)
     return {
         "ok": True, "agent": "mumble-agent", "version": AGENT_VERSION,
         "ice": _MumbleServer is not None,
@@ -701,8 +778,29 @@ async def ping(authorization: str = Header(default=None)) -> dict[str, Any]:
         "docker_version": docker_client.version().get("Version") if docker_client else None,
         "mumble_image":   DOCKER_IMAGE,
         "latest_image":   latest,
-        "update_available": latest is not None and latest != DOCKER_IMAGE,
+        "update_available": update_available,
+        "update_channel": UPDATE_CHANNEL,
     }
+
+def _write_agent_env(key: str, value: str) -> None:
+    """Schreibt/aktualisiert eine Variable in /etc/mumble-agent/agent.env."""
+    env_file = "/etc/mumble-agent/agent.env"
+    try:
+        with open(env_file, encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines, found = [], False
+        for line in lines:
+            if line.startswith(f"{key}="):
+                new_lines.append(f"{key}={value}\n")
+                found = True
+            else:
+                new_lines.append(line)
+        if not found:
+            new_lines.append(f"{key}={value}\n")
+        with open(env_file, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except OSError as e:
+        raise HTTPException(500, detail=f"agent.env schreiben fehlgeschlagen: {e}")
 
 @app.post("/v1/image")
 async def update_image(req: UpdateImageRequest,
@@ -711,26 +809,55 @@ async def update_image(req: UpdateImageRequest,
     check_token(authorization)
     if not re.match(r'^[a-zA-Z0-9][\w./:@-]{0,254}$', req.image):
         raise HTTPException(400, detail="ungültiger Image-Name")
-    env_file = "/etc/mumble-agent/agent.env"
-    try:
-        with open(env_file, encoding="utf-8") as f:
-            lines = f.readlines()
-        new_lines, found = [], False
-        for line in lines:
-            if line.startswith("MUMBLE_AGENT_IMAGE="):
-                new_lines.append(f"MUMBLE_AGENT_IMAGE={req.image}\n")
-                found = True
-            else:
-                new_lines.append(line)
-        if not found:
-            new_lines.append(f"MUMBLE_AGENT_IMAGE={req.image}\n")
-        with open(env_file, "w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-    except OSError as e:
-        raise HTTPException(500, detail=f"agent.env schreiben fehlgeschlagen: {e}")
+    _write_agent_env("MUMBLE_AGENT_IMAGE", req.image)
     print(f"[mumble-agent] Image aktualisiert auf {req.image} — starte neu…", flush=True)
     asyncio.get_event_loop().call_later(1.0, lambda: sys.exit(0))
     return {"ok": True, "image": req.image, "restarting": True}
+
+@app.post("/v1/channel")
+async def update_channel(req: UpdateChannelRequest,
+                         authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Aktualisiert MUMBLE_AGENT_UPDATE_CHANNEL in agent.env und startet den Agent neu."""
+    check_token(authorization)
+    _write_agent_env("MUMBLE_AGENT_UPDATE_CHANNEL", req.channel)
+    print(f"[mumble-agent] Update-Kanal geändert auf {req.channel} — starte neu…", flush=True)
+    asyncio.get_event_loop().call_later(1.0, lambda: sys.exit(0))
+    return {"ok": True, "channel": req.channel, "restarting": True}
+
+@app.get("/v1/images")
+async def list_images(authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Verfügbare Mumble-Server-Versionen aus dem Update-Check-Cache (kein Live-Call im Request-Pfad).
+    Jedes Image trägt ein prerelease-Flag aus den GitHub-Releases von mumble-voip/mumble
+    (Docker Hub selbst kennt keine stable/beta-Kanäle). Im stable-Kanal (Default) werden
+    Pre-Releases komplett aus der Liste gefiltert. Der aktive Kanal ist eine bewusste,
+    seltene Host-Einstellung (POST /v1/channel, mit Neustart) statt einer Pro-Request-
+    Option — response.channel verrät dem Plugin, welcher Kanal gerade aktiv ist."""
+    check_token(authorization)
+    tags = _update_cache.get("tags") or []
+    if not tags:
+        # Cache noch leer (Agent gerade erst gestartet, Loop noch nicht gelaufen) — einmalig nachladen
+        loop = asyncio.get_event_loop()
+        tags        = await loop.run_in_executor(None, _fetch_available_tags) or []
+        prereleases = await loop.run_in_executor(None, _fetch_github_prereleases)
+        if prereleases is not None:
+            _update_cache["prereleases"] = prereleases
+        if tags:
+            _update_cache["tags"]       = tags
+            _update_cache["latest"]     = _pick_latest(tags, _update_cache.get("prereleases") or {}, UPDATE_CHANNEL)
+            _update_cache["checked_at"] = int(time.time())
+    prereleases  = _update_cache.get("prereleases") or {}
+    latest_image = _update_cache.get("latest")
+    if UPDATE_CHANNEL == "stable":
+        tags = [t for t in tags if not prereleases.get(t.split(":", 1)[-1], False)]
+    images = [
+        {
+            "image":      img,
+            "prerelease": prereleases.get(img.split(":", 1)[-1], False),
+            "latest":     img == latest_image,
+        }
+        for img in tags
+    ]
+    return {"ok": True, "images": images, "current": DOCKER_IMAGE, "channel": UPDATE_CHANNEL}
 
 @app.get("/v1/servers")
 async def list_servers(authorization: str = Header(default=None)) -> dict[str, Any]:
@@ -779,21 +906,22 @@ async def create_server(req: CreateServerRequest,
                         authorization: str = Header(default=None)) -> dict[str, Any]:
     check_token(authorization)
     assert docker_client is not None
+    target_image = req.image or DOCKER_IMAGE
     name     = _container_name(req.external_id, req.port)
     data_dir = _data_dir(name)
     os.makedirs(data_dir, mode=0o750, exist_ok=True)
     # Image vorab ziehen damit containers.run() nicht blockiert
     try:
-        docker_client.images.get(DOCKER_IMAGE)
+        docker_client.images.get(target_image)
     except docker.errors.ImageNotFound:
         try:
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: docker_client.images.pull(DOCKER_IMAGE))
+            await loop.run_in_executor(None, lambda: docker_client.images.pull(target_image))
         except APIError as e:
             raise HTTPException(500, detail=f"image pull fehlgeschlagen: {e}")
     try:
         c = docker_client.containers.run(
-            image=DOCKER_IMAGE, name=name, detach=True,
+            image=target_image, name=name, detach=True,
             restart_policy={"Name": "unless-stopped"},
             environment=_config_for(req),
             volumes={data_dir: {"bind": "/data", "mode": "rw"}},
@@ -870,21 +998,38 @@ async def stop_server(cid: str, authorization: str = Header(default=None)) -> di
     return {"ok": True}
 
 @app.post("/v1/servers/{cid}/upgrade")
-async def upgrade_server(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:
-    """Container mit aktuellem DOCKER_IMAGE neu erstellen (Image-Upgrade)."""
+async def upgrade_server(cid: str, req: UpgradeRequest | None = None,
+                         authorization: str = Header(default=None)) -> dict[str, Any]:
+    """Container neu erstellen (Image-Upgrade). Optional Ziel-Version via req.image,
+    sonst aktuelles DOCKER_IMAGE — Aufrufe ohne Body bleiben unverändert."""
     check_token(authorization)
     assert docker_client is not None
+    target_image = (req.image if req else None) or DOCKER_IMAGE
+    force        = bool(req.force) if req else False
     try:
         c = docker_client.containers.get(cid)
         _require_managed(c)
     except NotFound:
         raise HTTPException(404, detail="container not found")
+    # Downgrade-Schutz: Mumble migriert das SQLite-Schema irreversibel (z.B. 1.5→1.6) —
+    # eine ältere Version startet danach nicht mehr ("no such column: value"). Nur mit
+    # explizitem force:true erlauben.
+    current_image = c.attrs.get("Config", {}).get("Image", "")
+    target_v, current_v = _parse_version(target_image), _parse_version(current_image)
+    if not force and target_v and current_v and target_v < current_v:
+        raise HTTPException(
+            409,
+            detail=(f"Downgrade {current_image} → {target_image} abgelehnt: "
+                    f"Mumble-SQLite-Schema ist nicht rückwärtskompatibel, der Server "
+                    f"würde danach nicht mehr starten. Mit \"force\": true erzwingen, "
+                    f"falls wirklich gewünscht (z.B. frischer Container ohne Bestandsdaten)."),
+        )
     # Image nur ziehen wenn nicht schon vorhanden
     try:
-        docker_client.images.get(DOCKER_IMAGE)
+        docker_client.images.get(target_image)
     except docker.errors.ImageNotFound:
         try:
-            docker_client.images.pull(DOCKER_IMAGE)
+            docker_client.images.pull(target_image)
         except APIError as e:
             raise HTTPException(500, detail=f"image pull fehlgeschlagen: {e}")
     # SQLite-DB auf NULL-Werte prüfen — Mumble 1.6 Migration bricht sonst ab
@@ -906,8 +1051,8 @@ async def upgrade_server(cid: str, authorization: str = Header(default=None)) ->
         old_env["MUMBLE_CONFIG_ICE"] = f"tcp -h 127.0.0.1 -p {_ice_port_for_port(mumble_port)}"
     except Exception:
         pass
-    new_c = _recreate_container(c, old_env)
-    return {"ok": True, "container_id": new_c.id, "image": DOCKER_IMAGE}
+    new_c = _recreate_container(c, old_env, image=target_image)
+    return {"ok": True, "container_id": new_c.id, "image": target_image}
 
 @app.post("/v1/servers/{cid}/restart")
 async def restart_server(cid: str, authorization: str = Header(default=None)) -> dict[str, Any]:

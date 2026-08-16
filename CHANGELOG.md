@@ -2,6 +2,28 @@
 
 Alle nennenswerten Änderungen an diesem Projekt werden hier dokumentiert.
 
+## [v2.14.0] — 2026-08-16
+
+Versionsauswahl beim Server-Upgrade/-Erstellung, für das esse-mumble-Plugin.
+
+### Hinzugefügt
+- **`GET /v1/images`**: liefert verfügbare Mumble-Server-Versionen aus dem Update-Check-Cache (kein Live-Docker-Hub-Call im Request-Pfad). Jedes Image trägt `prerelease` (aus den GitHub-Releases von `mumble-voip/mumble` — Docker Hub selbst kennt keine stable/beta-Kanäle) und `latest` (höchste **stabile** Version, nie eine Pre-Release, auch wenn sie numerisch neuer ist). Response: `{"ok", "current", "channel", "images": [{"image", "prerelease", "latest"}, ...]}`
+- **`POST /v1/servers/{cid}/upgrade`** akzeptiert optional `{"image": "mumblevoip/mumble-server:vX.Y.Z"}` — Upgrade/Downgrade auf eine bestimmte Version statt immer nur auf `MUMBLE_AGENT_IMAGE`. Aufrufe ohne Body bleiben unverändert. Downgrade auf eine ältere Version wird per Default abgelehnt (409) — Mumble migriert das SQLite-Schema irreversibel (z.B. 1.5→1.6), ein Downgrade lässt den Container sonst crash-loopen (`no such column: value`); mit `"force": true` weiterhin möglich
+- **`POST /v1/servers`** (Server-Erstellung) akzeptiert optional dasselbe `image`-Feld
+- **Update-Kanal**: `MUMBLE_AGENT_UPDATE_CHANNEL` in agent.env (`stable` Default, oder `prerelease`) steuert, ob Pre-Releases in `GET /v1/images` auftauchen und als `latest` zählen können. `POST /v1/channel` (`{"channel": "stable"|"prerelease"}`) schreibt die Variable und startet den Agent neu, analog zu `POST /v1/image`. `GET /v1/ping` liefert den aktiven Kanal als `update_channel`
+
+### Geändert
+- Update-Check cached die vollständige Tag-Liste statt nur des neuesten Tags, sortiert **numerisch nach Version** absteigend statt nach `last_updated` (garantierte bisher nicht die höchste Version)
+- `GET /v1/ping`: `update_available` vergleicht jetzt echte Versionsnummern (`latest > current`) statt nur Ungleichheit, und respektiert denselben Kanal wie `GET /v1/images` — verhindert ein irreführendes Update-Badge, wenn der laufende Container bereits eine numerisch neuere Pre-Release ist als die empfohlene stabile Version
+
+### Behoben
+- **`_recreate_container`**: Race Condition bei bereits crash-loopenden Containern — wird jetzt vor dem Umbenennen gestoppt statt danach, sonst kollidiert `rename()` mit Dockers Netzwerk-Sandbox-Teardown während des Auto-Restarts (`sandbox not found`)
+
+### Sicherheit
+- `image`-Felder bei Upgrade/Create sind strikt auf `^mumblevoip/mumble-server:v\d+\.\d+\.\d+$` gewhitelistet — kein beliebiger Image-Name pullbar, bewusst strenger als das freie Pattern bei `POST /v1/image`
+
+---
+
 ## [v2.13.0] — 2026-08-15
 
 ### Performance
